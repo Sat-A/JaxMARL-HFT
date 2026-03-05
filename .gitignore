@@ -113,3 +113,11 @@ debug_output/*
 jax_trace/*
 .ipython/*
 baseline_sweep_results/*
+
+# JaxMARL-HFT runtime artifacts
+checkpoints/
+checkpoints/**
+pre_reset_states/
+pre_reset_states/**
+trajectories/
+trajectories/**
