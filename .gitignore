@@ -121,3 +121,4 @@ pre_reset_states/
 pre_reset_states/**
 trajectories/
 trajectories/**
+lobs5_checkpoints/
