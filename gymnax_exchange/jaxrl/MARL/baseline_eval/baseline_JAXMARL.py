@@ -547,31 +547,89 @@ def make_sim(config):
                 init_dones_agents.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool))
 
 
-            train_states.reverse()  # Reverse the list to match the order of instances
-            target_ckpt= {
-                'model': train_states,  # train_states
-                # 'config': {} ,
-                'metrics': {
-                    'train_rewards': [np.nan,np.nan],
-                    'eval_rewards': [np.nan,np.nan],
-                    }
-            }
             orbax_checkpointer = oxcp.PyTreeCheckpointer()
+            checkpoint_base_dir = config.get(
+                "CHECKPOINT_BASE_DIR",
+                f'{config["world_config"]["alphatradePath"]}/checkpoints/MARLCheckpoints'
+            )
             checkpoint_manager = oxcp.CheckpointManager(
-             f'/home/myuser/data/checkpoints/MARLCheckpoints/{config["RESTORE_PROJECT"]}/{config["RESTORE_RUN"]}', orbax_checkpointer
+             f'{checkpoint_base_dir}/{config["RESTORE_PROJECT"]}/{config["RESTORE_RUN"]}', orbax_checkpointer
                 )
             if step is None:
                 step=checkpoint_manager.latest_step()
 
-            restored_state = checkpoint_manager.restore(
-                step,
-                items=target_ckpt,
-                restore_kwargs={'restore_args': orbax_utils.restore_args_from_target(target_ckpt)}
-            )
+            def _restore_with_template(template_states):
+                # Different runs may store different checkpoint trees.
+                # Try common schemas from this repo in a safe fallback order.
+                candidate_targets = [
+                    {
+                        'model': template_states,
+                        'metrics': {
+                            'train_rewards': [np.nan] * len(template_states),
+                        },
+                    },
+                    {
+                        'model': template_states,
+                        'metrics': {
+                            'train_rewards': [np.nan] * len(template_states),
+                            'eval_rewards': [np.nan] * len(template_states),
+                        },
+                    },
+                    {
+                        'model': template_states,
+                    },
+                ]
 
-            # print(isinstance(restored_state["model"], list))
+                last_err = None
+                for target_ckpt in candidate_targets:
+                    try:
+                        return checkpoint_manager.restore(
+                            step,
+                            items=target_ckpt,
+                            restore_kwargs={'restore_args': orbax_utils.restore_args_from_target(target_ckpt)}
+                        )
+                    except ValueError as err:
+                        # Tree mismatches are expected between schema variants.
+                        last_err = err
+                        continue
+
+                raise ValueError(
+                    "Unable to restore checkpoint using supported schemas "
+                    "(model, model+train_rewards, model+train_rewards+eval_rewards)."
+                ) from last_err
+
+            def _is_compatible_order(candidate_train_states):
+                for agent_i, candidate_state in enumerate(candidate_train_states):
+                    obs_dim = env.observation_spaces[agent_i].shape[0]
+                    try:
+                        test_hstate = ScannedRNN.initialize_carry(
+                            config["NUM_ENVS"], config["GRU_HIDDEN_DIM"]
+                        )
+                        test_input = (
+                            jnp.zeros((1, config["NUM_ENVS"], obs_dim)),
+                            jnp.zeros((1, config["NUM_ENVS"])),
+                        )
+                        candidate_state.apply_fn(candidate_state.params, test_hstate, test_input)
+                    except Exception:
+                        return False
+                return True
+
+            # Try direct template order first.
+            restored_state = _restore_with_template(train_states)
             restored_train_states = restored_state['model']
-            restored_train_states.reverse()
+
+            # If not compatible, try reversed template order at restore-time,
+            # then reverse back to env order for downstream usage.
+            if not _is_compatible_order(restored_train_states):
+                reversed_template = list(reversed(train_states))
+                restored_state = _restore_with_template(reversed_template)
+                restored_train_states = list(reversed(restored_state['model']))
+                if not _is_compatible_order(restored_train_states):
+                    raise ValueError(
+                        "Restored model parameters are incompatible with current environment "
+                        "observation spaces for both restore template orders. "
+                        "Ensure ENV_CONFIG and checkpoint originate from the same training setup."
+                    )
             # print(len(restored_train_states), " restored train states")
 
             # for i,ts in enumerate(restored_train_states):
@@ -924,10 +982,10 @@ def make_sim(config):
                     print(f"  {agent_type} (Agent type {i}): avg_reward = {eval_metrics['avg_reward'][i]:.4f}")
                     for main_metric in ["reward_portfolio_value","revenue_direction_normalised"]:
                         if main_metric in eval_metrics["traj_batch"][i].info['agent'].keys():
-                            print(f"    {agent_type} (Agent type {i}): PNL = {eval_metrics["traj_batch"][i].info['agent'][main_metric].mean()}")
+                            print(f"    {agent_type} (Agent type {i}): PNL = {eval_metrics['traj_batch'][i].info['agent'][main_metric].mean()}")
                             if main_metric == "reward_portfolio_value":
-                                print(f"    {agent_type} (Agent type {i}): Dimensions = {eval_metrics["traj_batch"][i].info['agent'][main_metric].shape}")
-                                print(f"    {agent_type} (Agent type {i}): PNL std = {eval_metrics["traj_batch"][i].info['agent'][main_metric][63::64,:].mean()}")
+                                print(f"    {agent_type} (Agent type {i}): Dimensions = {eval_metrics['traj_batch'][i].info['agent'][main_metric].shape}")
+                                print(f"    {agent_type} (Agent type {i}): PNL std = {eval_metrics['traj_batch'][i].info['agent'][main_metric][63::64,:].mean()}")
                 # callback(eval_metrics)
                 del eval_metrics
                 gc.collect()
