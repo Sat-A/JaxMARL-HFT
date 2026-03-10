@@ -104,6 +104,47 @@ including:
 - `verification_summary.json`
 - `verification_report.txt`
 
+### 7. Multi-Step Fixed/Random Policy Verification
+
+The same script supports multi-step rollouts with either a fixed action or random actions:
+
+```bash
+# 20-step random actions
+python minimal_agent_generative_step.py \
+  --fast_startup \
+  --n_cond_msgs 8 \
+  --sample_index 0 \
+  --n_steps 20 \
+  --action_policy random \
+  --seed 42 \
+  --run_name verify_20step_random
+```
+
+```bash
+# 100-step random actions
+python minimal_agent_generative_step.py \
+  --fast_startup \
+  --n_cond_msgs 8 \
+  --sample_index 0 \
+  --n_steps 100 \
+  --action_policy random \
+  --seed 42 \
+  --run_name verify_100step_random
+```
+
+Additional artifacts include:
+- `step_trace.csv` (per-step action and market state)
+- `midprice_trajectory.png` (historical + generated midprice)
+- `action_midprice_trajectory.png` (actions and midprice combined)
+
+`verification_summary.json` now includes end-of-run `agent_pnl` (cash, inventory mark-to-market, and total PnL in tick-normalized units).
+
+### Note On Latest 100-Step Test
+
+- A 100-step random-policy run was started and progressed well beyond step 60, showing at least one regime change in spread/midprice behavior mid-rollout.
+- The job was intentionally terminated by user request before completion (`Kill all jobs`), so treat that run as a partial trace, not a final benchmark.
+- For a complete 100-step benchmark, rerun the command above without interruption.
+
 ## Docker Setup (alternative)
 
 For **x86_64/amd64 only** (base image: `nvcr.io/nvidia/jax`). Edit the `Makefile` to set `DATADIR` to your LOBSTER data directory, then:

@@ -97,3 +97,11 @@ Interpretation:
 1. Implement persistent inference server mode in-process (single compile warmup, repeated requests).
 2. Keep worker pinned to a dedicated GPU and queue requests.
 3. Optional: profile inside LOBS5 generate path to reduce compile graph size where possible.
+
+## 100-Step Random-Policy World-Model Test Note
+
+- A long-run stress test was launched with random agent actions (`n_steps=100`, `action_policy=random`).
+- The run progressed substantially (well beyond step 60) and produced non-trivial state evolution at least once (spread/midprice regime shift during rollout).
+- The job was then intentionally terminated on user request (`Kill all jobs`) before final artifact flush.
+- Interpretation: this should be treated as a partial diagnostic trace, not a complete benchmark result.
+- Action item: rerun the same command uninterrupted to produce a full 100-step report and stable end-of-run PnL summary.
