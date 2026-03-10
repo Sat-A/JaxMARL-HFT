@@ -76,6 +76,34 @@ The first run preprocesses the LOBSTER data and caches it. Subsequent runs are m
 
 To enable [Weights & Biases](https://wandb.ai/) experiment tracking, run `wandb login` and then add `WANDB_MODE="online" ENTITY="your-wandb-entity" PROJECT="your-project-name"` to the training command. These can also be set directly in the YAML configs (`config/rl_configs/*.yaml`). The YAML configs support [WandB sweeps](https://docs.wandb.ai/guides/sweeps) — when a `SWEEP_PARAMETERS` section is present and `WANDB_MODE` is not `"disabled"`, training automatically creates a sweep.
 
+### 6. One-Step Agent + Generative Verification
+
+For a minimal process check that combines:
+1. historical-message startup,
+2. one market-maker action,
+3. one generative model world-update step,
+
+use:
+
+```bash
+python minimal_agent_generative_step.py \
+  --fast_startup \
+  --n_cond_msgs 8 \
+  --sample_index 0 \
+  --agent_action 0 \
+  --run_name verify_a0
+```
+
+Artifacts are saved under:
+
+`outputs/minimal_agent_generative_step/<run_name>_action<id>_sample<idx>/`
+
+including:
+- `agent_action_messages.csv`
+- `generated_message.csv`
+- `verification_summary.json`
+- `verification_report.txt`
+
 ## Docker Setup (alternative)
 
 For **x86_64/amd64 only** (base image: `nvcr.io/nvidia/jax`). Edit the `Makefile` to set `DATADIR` to your LOBSTER data directory, then:
