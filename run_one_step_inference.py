@@ -393,7 +393,11 @@ def main() -> int:
     if not gen_files:
         raise RuntimeError(f"No generated message CSV files found in {run_dir / 'data_gen'}")
 
-    gen_df = pd.read_csv(gen_files[0])
+    gen_df = pd.read_csv(
+        gen_files[0],
+        header=None,
+        names=["time", "event_type", "order_id", "size", "price", "direction"],
+    )
     if gen_df.empty:
         out_df = pd.DataFrame(
             [
