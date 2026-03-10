@@ -11,6 +11,7 @@ import argparse
 import importlib
 import json
 import os
+import re
 import sys
 import time
 from glob import glob
@@ -246,10 +247,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_root", default=str(DEFAULT_OUTPUT_ROOT), help="Centralized root for one-step outputs")
 
     parser.add_argument("--n_cond_msgs", type=int, default=500, help="Number of conditioning messages")
+    parser.add_argument("--n_gen_msgs", type=int, default=1, help="Number of messages (steps) to generate")
     parser.add_argument("--sample_top_n", type=int, default=-1, help="Sampling mode (-1 full distribution, 1 greedy)")
     parser.add_argument("--sample_index", type=int, default=0, help="Dataset index to use for deterministic single sample")
+    parser.add_argument(
+        "--sample_indices",
+        default="",
+        help="Comma-separated dataset indices to run in one process (compile amortization)",
+    )
     parser.add_argument("--test_split", type=float, default=1.0, help="Fraction of files to include from tail")
     parser.add_argument("--seed", type=int, default=42, help="JAX random seed")
+    parser.add_argument("--n_samples", type=int, default=1, help="Number of samples to run in this invocation")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for parallel generation in one invocation")
+    parser.add_argument(
+        "--compile_cache_dir",
+        default=str(REPO_ROOT / ".cache" / "jax_compilation"),
+        help="JAX compilation cache directory (persisted across runs)",
+    )
+    parser.add_argument(
+        "--fast_startup",
+        action="store_true",
+        help="Prefer lower startup overhead (disables big upfront GPU preallocation)",
+    )
 
     return parser.parse_args()
 
@@ -257,9 +276,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
-    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.90")
+    if args.fast_startup:
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.50")
+    else:
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
+        os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.90")
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path(args.compile_cache_dir).expanduser().resolve()))
     os.environ.setdefault("PYTHONNOUSERSITE", "1")
+
+    t0 = time.time()
+    timing = {}
 
     ckpt_path = Path(args.ckpt_path).expanduser().resolve()
     data_dir = Path(args.data_dir).expanduser().resolve()
@@ -289,10 +316,13 @@ def main() -> int:
     if not book_files:
         raise FileNotFoundError(f"No *book*.npy or *orderbook*.npy files found in {data_dir}")
 
+    t1 = time.time()
     step = args.checkpoint_step if args.checkpoint_step is not None else _latest_checkpoint_step(ckpt_path)
     params = _restore_params_only(ckpt_path, step)
     ckpt_vocab_size = int(params["message_encoder"]["encoder"]["embedding"].shape[0])
+    timing["checkpoint_restore_seconds"] = time.time() - t1
 
+    t2 = time.time()
     _add_python_paths(lobs5_root)
 
     if ckpt_vocab_size >= 10000:
@@ -301,7 +331,9 @@ def main() -> int:
     from lob.encoding import Message_Tokenizer, Vocab
     from lob.init_train import init_train_state
     from lob import inference_no_errcorr as inference
+    timing["imports_and_compat_seconds"] = time.time() - t2
 
+    t3 = time.time()
     model_args = _load_metadata_robust(ckpt_path)
     model_args = _ensure_model_args_defaults(model_args)
     model_args.num_devices = 1
@@ -311,8 +343,8 @@ def main() -> int:
     if ckpt_vocab_size >= 10000:
         model_args.token_mode = 22
 
-    n_gen_msgs = 1
-    n_eval_messages = 2
+    n_gen_msgs = max(1, int(args.n_gen_msgs))
+    n_eval_messages = n_gen_msgs + 1
     cond_seq_len = args.n_cond_msgs * Message_Tokenizer.MSG_LEN
     eval_seq_len = (n_eval_messages - 1) * Message_Tokenizer.MSG_LEN
 
@@ -330,7 +362,9 @@ def main() -> int:
 
     state = init_state.replace(params=params, step=step)
     model = model_cls(training=False, step_rescale=1.0)
+    timing["model_init_seconds"] = time.time() - t3
 
+    t4 = time.time()
     ds = inference.get_dataset(
         str(data_dir),
         args.n_cond_msgs,
@@ -340,28 +374,56 @@ def main() -> int:
     if len(ds) == 0:
         raise RuntimeError("Dataset is empty after applying test_split")
 
-    chosen_index = max(0, min(args.sample_index, len(ds) - 1))
+    requested_indices = []
+    if args.sample_indices.strip():
+        for tok in args.sample_indices.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            requested_indices.append(int(tok))
+
+    if requested_indices:
+        selected_indices = [max(0, min(i, len(ds) - 1)) for i in requested_indices]
+    else:
+        selected_indices = [max(0, min(args.sample_index, len(ds) - 1))]
+
+    # If user did not override n_samples/batch_size, auto-fit to selected indices.
+    if args.sample_indices.strip() and args.n_samples == 1 and args.batch_size == 1:
+        args.n_samples = len(selected_indices)
+        args.batch_size = len(selected_indices)
+
+    if args.n_samples > len(selected_indices):
+        raise ValueError(
+            f"n_samples ({args.n_samples}) cannot exceed selected dataset length ({len(selected_indices)})"
+        )
+
+    if args.n_samples % args.batch_size != 0:
+        raise ValueError("n_samples must be divisible by batch_size")
 
     class _SingleSampleDataset:
-        def __init__(self, base_ds, idx: int):
+        def __init__(self, base_ds, idx_list):
             self.base_ds = base_ds
-            self.idx = idx
+            self.idx_list = list(idx_list)
 
         def __len__(self):
-            return 1
+            return len(self.idx_list)
+
+        def _map_index(self, i: int) -> int:
+            return self.idx_list[max(0, min(i, len(self.idx_list) - 1))]
 
         def __getitem__(self, query_idx):
             if isinstance(query_idx, list):
-                mapped = [self.idx for _ in query_idx]
+                mapped = [self._map_index(i) for i in query_idx]
                 return self.base_ds[mapped]
             if isinstance(query_idx, int):
-                return self.base_ds[[self.idx]]
-            return self.base_ds[[self.idx]]
+                return self.base_ds[[self._map_index(query_idx)]]
+            return self.base_ds[[self._map_index(0)]]
 
         def get_date(self, _):
-            return self.base_ds.get_date(self.idx)
+            return self.base_ds.get_date(self._map_index(0))
 
-    ds_one = _SingleSampleDataset(ds, chosen_index)
+    ds_one = _SingleSampleDataset(ds, selected_indices)
+    timing["dataset_prepare_seconds"] = time.time() - t4
 
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -369,8 +431,8 @@ def main() -> int:
 
     start = time.time()
     inference.sample_new(
-        n_samples=1,
-        batch_size=1,
+        n_samples=args.n_samples,
+        batch_size=args.batch_size,
         ds=ds_one,
         rng=rng,
         seq_len_cond=cond_seq_len,
@@ -388,16 +450,29 @@ def main() -> int:
         overfit_debug=False,
     )
     runtime_s = time.time() - start
+    timing["sample_new_seconds"] = runtime_s
 
+    t5 = time.time()
     gen_files = sorted(glob(str(run_dir / "data_gen" / "*message*.csv")))
     if not gen_files:
         raise RuntimeError(f"No generated message CSV files found in {run_dir / 'data_gen'}")
 
-    gen_df = pd.read_csv(
-        gen_files[0],
-        header=None,
-        names=["time", "event_type", "order_id", "size", "price", "direction"],
-    )
+    def _sample_index_from_filename(p: str) -> int:
+        m = re.search(r"real_id_(\d+)", Path(p).name)
+        return int(m.group(1)) if m else -1
+
+    frames = []
+    for gf in gen_files:
+        df = pd.read_csv(
+            gf,
+            header=None,
+            names=["time", "event_type", "order_id", "size", "price", "direction"],
+        )
+        if not df.empty:
+            df.insert(0, "inferred_sample_index", _sample_index_from_filename(gf))
+            frames.append(df)
+
+    gen_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if gen_df.empty:
         out_df = pd.DataFrame(
             [
@@ -405,7 +480,7 @@ def main() -> int:
                     "checkpoint_path": str(ckpt_path),
                     "checkpoint_step": int(step),
                     "stock": args.stock,
-                    "sample_index": int(chosen_index),
+                    "sample_index": int(selected_indices[0]),
                     "seed": int(args.seed),
                     "runtime_seconds": float(runtime_s),
                     "source_generated_file": str(gen_files[0]),
@@ -419,16 +494,18 @@ def main() -> int:
         out_df.insert(0, "checkpoint_path", str(ckpt_path))
         out_df.insert(1, "checkpoint_step", int(step))
         out_df.insert(2, "stock", args.stock)
-        out_df.insert(3, "sample_index", int(chosen_index))
+        out_df.insert(3, "sample_index", int(selected_indices[0]))
         out_df.insert(4, "seed", int(args.seed))
         out_df.insert(5, "runtime_seconds", float(runtime_s))
         out_df.insert(6, "source_generated_file", str(gen_files[0]))
         out_df.insert(7, "generation_status", "ok")
         out_df.insert(8, "generated_rows", len(gen_df))
+    timing["csv_postprocess_seconds"] = time.time() - t5
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_file, index=False)
 
+    total_runtime = time.time() - t0
     summary = {
         "run_name": run_name,
         "run_root": str(run_root),
@@ -438,9 +515,22 @@ def main() -> int:
         "checkpoint_step": int(step),
         "data_dir": str(data_dir),
         "stock": args.stock,
-        "sample_index": int(chosen_index),
+        "sample_index": int(selected_indices[0]),
+        "sample_indices": [int(i) for i in selected_indices],
         "seed": int(args.seed),
         "runtime_seconds": float(runtime_s),
+        "total_runtime_seconds": float(total_runtime),
+        "timing_breakdown": timing,
+        "n_samples": int(args.n_samples),
+        "batch_size": int(args.batch_size),
+        "n_cond_msgs": int(args.n_cond_msgs),
+        "n_gen_msgs": int(n_gen_msgs),
+        "sample_top_n": int(args.sample_top_n),
+        "jax_backend": jax.default_backend(),
+        "jax_visible_devices": int(jax.local_device_count()),
+        "compile_cache_dir": os.environ.get("JAX_COMPILATION_CACHE_DIR", ""),
+        "xla_preallocate": os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", ""),
+        "xla_mem_fraction": os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", ""),
         "generation_status": str(out_df.iloc[0]["generation_status"]),
         "generated_rows": int(out_df.iloc[0]["generated_rows"]),
     }
@@ -456,6 +546,8 @@ def main() -> int:
     print(f"Run dir:     {run_dir}")
     print(f"Output CSV:  {output_file}")
     print(f"Rows:        {len(out_df)}")
+    print(f"Sample time: {runtime_s:.3f}s")
+    print(f"Total time:  {total_runtime:.3f}s")
     print("==============================================")
 
     return 0
