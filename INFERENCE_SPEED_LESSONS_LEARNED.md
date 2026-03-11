@@ -98,10 +98,24 @@ Interpretation:
 2. Keep worker pinned to a dedicated GPU and queue requests.
 3. Optional: profile inside LOBS5 generate path to reduce compile graph size where possible.
 
-## 100-Step Random-Policy World-Model Test Note
+## Random-Policy Long-Run Stress Tests
 
-- A long-run stress test was launched with random agent actions (`n_steps=100`, `action_policy=random`).
-- The run progressed substantially (well beyond step 60) and produced non-trivial state evolution at least once (spread/midprice regime shift during rollout).
-- The job was then intentionally terminated on user request (`Kill all jobs`) before final artifact flush.
-- Interpretation: this should be treated as a partial diagnostic trace, not a complete benchmark result.
-- Action item: rerun the same command uninterrupted to produce a full 100-step report and stable end-of-run PnL summary.
+### 100-Step Note
+
+- A 100-step random-policy run was started and progressed substantially (well past step 60), showing at least one regime change in spread/midprice behavior mid-rollout.
+- The job was intentionally terminated on user request before final artifact flush — treat that trace as partial, not a complete benchmark.
+
+### Book-Crash Safeguards (added 2026-03-11)
+
+- **Root cause**: random actions can produce limit orders with price <= 0 (agent quoting relative to a stale or zero midprice). A zero-price bid enters the book and clears the bid side, making `best_bid = -1`. The next step then computes midprice = (−1 + ask) / 2, an artificial ~50% crash, and also quotes the next action relative to that garbage midprice — compound cascade.
+- **Fix applied** in `minimal_agent_generative_step.py`:
+  1. `_sanitize_action_msgs`: converts any type-1 (limit-add) order with price <= 0 to a no-op before simulator ingestion.
+  2. Agent-action revert guard: if best_bid or best_ask goes <= 0 after applying agent messages, roll back to pre-action state.
+  3. Generated-message revert guard: same check after the LOBS5-generated message is applied.
+- **Lesson**: always guard simulator state validity at both ingestion points (agent orders and generator output) when running unsupervised random or exploratory policies. The historical-sequence replay already filtered for bid > 0 && ask > 0 but the rollout loop did not.
+
+### 1000-Step Verification Run
+
+- Command: `CUDA_VISIBLE_DEVICES=4,5,6,7 python minimal_agent_generative_step.py --fast_startup --n_cond_msgs 8 --sample_index 0 --sample_top_n 1 --n_steps 1000 --action_policy random --seed 42 --run_name verify_1kstep_random_gpus4567_safeguards`
+- Purpose: verify that the book-crash safeguards keep the simulator stable across 1000 random-action steps.
+- Run in progress; results will be reflected in the output directory once complete.

@@ -131,6 +131,18 @@ def _midprice_from_quotes(bid: int, ask: int) -> float:
     return (float(bid) + float(ask)) / 2.0
 
 
+def _sanitize_action_msgs(msgs: jnp.ndarray) -> jnp.ndarray:
+    """Nullify limit-add orders with price <= 0 to prevent book corruption.
+
+    Message layout: [type, side, qty, price, order_id, trader_id, time_s, time_ns]
+    Type 1 = new limit order; setting type to 0 makes the message a no-op.
+    """
+    types = msgs[:, 0]
+    prices = msgs[:, 3]
+    nullify = (types == 1) & (prices <= 0)
+    return msgs.at[:, 0].set(jnp.where(nullify, jnp.zeros_like(types), types))
+
+
 def _price_to_dollars(price_int: float) -> float:
     # LOBSTER-style prices are integerized (1/10000 dollar units).
     return float(price_int) / 10000.0
@@ -466,9 +478,15 @@ def main() -> int:
             jnp.array([-9000 - (2 * step_i + 1), -9000 - (2 * step_i + 2)], dtype=jnp.int32)
         )
 
+        action_msgs = _sanitize_action_msgs(action_msgs)
         bid_before, ask_before = _best_quotes(sim, current_sim_state)
         sim_state_after_action = sim.process_orders_array(current_sim_state, action_msgs)
         bid_after_action, ask_after_action = _best_quotes(sim, sim_state_after_action)
+        if bid_after_action <= 0 or ask_after_action <= 0:
+            # Agent action cleared one side of the book; revert to pre-action snapshot.
+            print(f"  [step {step_i + 1}] Agent action {int(action_this_step)} invalidated book (bid={bid_after_action}, ask={ask_after_action}); reverting.")
+            sim_state_after_action = current_sim_state
+            bid_after_action, ask_after_action = bid_before, ask_before
         changed = (bid_before != bid_after_action) or (ask_before != ask_after_action)
 
         rng, rng_gen = jax.random.split(rng)
@@ -503,6 +521,11 @@ def main() -> int:
         gen_sim_msg = inference.msg_to_jnp(first_msg)
         sim_state_after_step = sim.process_order_array(sim_state_after_action, gen_sim_msg)
         bid_after_step, ask_after_step = _best_quotes(sim, sim_state_after_step)
+        if bid_after_step <= 0 or ask_after_step <= 0:
+            # Generated message cleared one side of the book; keep pre-step state.
+            print(f"  [step {step_i + 1}] Generated message invalidated book (bid={bid_after_step}, ask={ask_after_step}); reverting.")
+            sim_state_after_step = sim_state_after_action
+            bid_after_step, ask_after_step = bid_after_action, ask_after_action
         mid_after_step = _midprice_from_quotes(bid_after_step, ask_after_step)
         spread_after_step = int(ask_after_step - bid_after_step)
 

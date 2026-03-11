@@ -132,6 +132,18 @@ python minimal_agent_generative_step.py \
   --run_name verify_100step_random
 ```
 
+```bash
+# 1000-step random actions (GPUs 4-7)
+CUDA_VISIBLE_DEVICES=4,5,6,7 python minimal_agent_generative_step.py \
+  --fast_startup \
+  --n_cond_msgs 8 \
+  --sample_index 0 \
+  --n_steps 1000 \
+  --action_policy random \
+  --seed 42 \
+  --run_name verify_1kstep_random
+```
+
 Additional artifacts include:
 - `step_trace.csv` (per-step action and market state)
 - `midprice_trajectory.png` (historical + generated midprice)
@@ -139,11 +151,15 @@ Additional artifacts include:
 
 `verification_summary.json` now includes end-of-run `agent_pnl` (cash, inventory mark-to-market, and total PnL in tick-normalized units).
 
-### Note On Latest 100-Step Test
+### Book-Crash Safeguards
 
-- A 100-step random-policy run was started and progressed well beyond step 60, showing at least one regime change in spread/midprice behavior mid-rollout.
-- The job was intentionally terminated by user request before completion (`Kill all jobs`), so treat that run as a partial trace, not a final benchmark.
-- For a complete 100-step benchmark, rerun the command above without interruption.
+Random actions can occasionally post orders with invalid (zero or negative) prices, which clears one side of the order book and corrupts the midprice for all subsequent steps. Three safeguards are applied inside the rollout loop:
+
+1. **Price sanitisation** — any limit order with `price <= 0` is converted to a no-op before it reaches the simulator.
+2. **Agent action revert** — if the agent's messages leave `best_bid <= 0` or `best_ask <= 0`, the post-action state is rolled back to the pre-action snapshot and the step continues from there.
+3. **Generated message revert** — same check after the LOBS5 generated message is applied.
+
+Both revert events are printed as diagnostics during the rollout.
 
 ## Docker Setup (alternative)
 
