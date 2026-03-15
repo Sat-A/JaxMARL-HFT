@@ -70,8 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_steps", type=int, default=5, help="Number of rollout steps with fixed action")
     parser.add_argument(
         "--action_policy",
-        choices=["fixed", "random"],
-        default="fixed",
+        choices=["fixed", "random", "market_making"],
+        default="market_making",
         help="Agent action policy across rollout steps",
     )
     parser.add_argument("--seed", type=int, default=42, help="PRNG seed")
@@ -315,7 +315,26 @@ def _compute_agent_pnl_from_trades(
     }
 
 
+def _select_market_making_action(
+    mm_cfg,
+    agent_state,
+) -> jnp.int32:
+    """Select a deterministic market-making action from current inventory.
+
+    For bobStrategy, action controls inventory sensitivity via kappa.
+    Higher inventory magnitude -> stronger inventory-rebalancing action.
+    """
+    if int(mm_cfg.n_actions) <= 1:
+        return jnp.int32(0)
+
+    inventory_abs = float(abs(agent_state.inventory))
+    inv_bucket = int(inventory_abs // max(1, int(mm_cfg.bob_v0)))
+    action = min(inv_bucket, int(mm_cfg.n_actions) - 1)
+    return jnp.int32(action)
+
+
 def main() -> int:
+    run_t0 = time.perf_counter()
     args = parse_args()
     _configure_runtime(args)
     artifacts = _prepare_run_artifacts(args)
@@ -327,7 +346,9 @@ def main() -> int:
     _add_python_paths(lobs5_root)
 
     step = args.checkpoint_step if args.checkpoint_step is not None else _latest_checkpoint_step(ckpt_path)
+    t_restore_t0 = time.perf_counter()
     params = _restore_params_only(ckpt_path, step)
+    restore_sec = time.perf_counter() - t_restore_t0
     ckpt_vocab_size = int(params["message_encoder"]["encoder"]["embedding"].shape[0])
     if ckpt_vocab_size >= 10000:
         _enable_legacy_token_mode_22()
@@ -367,12 +388,14 @@ def main() -> int:
     state = init_state.replace(params=params, step=step)
     model = model_cls(training=False, step_rescale=1.0)
 
+    t_dataset_t0 = time.perf_counter()
     ds = inference.get_dataset(
         str(data_dir),
         args.n_cond_msgs,
         n_eval_messages,
         test_split=args.test_split,
     )
+    dataset_load_sec = time.perf_counter() - t_dataset_t0
     if len(ds) == 0:
         raise RuntimeError("Dataset is empty")
     idx = max(0, min(args.sample_index, len(ds) - 1))
@@ -391,12 +414,14 @@ def main() -> int:
 
     print("Historical messages loaded")
 
+    t_sim_init_t0 = time.perf_counter()
     sim = inference.OrderBook(cfg=JAXLOB_Configuration())
     sim_states = inference.get_sims_vmap(book_l2_init, m_seq_raw_inp, init_time_batched, sim)
     sim_state = jax.tree_util.tree_map(lambda x: x[0], sim_states)
+    sim_init_sec = time.perf_counter() - t_sim_init_t0
 
     world_cfg = World_EnvironmentConfig(tick_size=100)
-    mm_cfg = MarketMaking_EnvironmentConfig(action_space="simple", fixed_quant_value=10)
+    mm_cfg = MarketMaking_EnvironmentConfig(action_space="bobStrategy", fixed_quant_value=10, bob_v0=10)
     mm_agent = MarketMakingAgent(cfg=mm_cfg, world_config=world_cfg)
 
     agent_state = MMEnvState(
@@ -416,6 +441,7 @@ def main() -> int:
     print("Agent initialised")
 
     # Build historical midprice series from the conditioning replay only.
+    t_hist_replay_t0 = time.perf_counter()
     historical_midprices: list[float] = []
     historical_state = sim.reset(book_l2_init[0], world_time)
     for i in range(args.n_cond_msgs):
@@ -424,7 +450,9 @@ def main() -> int:
         h_bid, h_ask = _best_quotes(sim, historical_state)
         if h_bid > 0 and h_ask > 0:
             historical_midprices.append(_midprice_from_quotes(h_bid, h_ask))
+    historical_replay_sec = time.perf_counter() - t_hist_replay_t0
 
+    t_hidden_init_t0 = time.perf_counter()
     init_hidden = model.initialize_carry(
         1,
         hidden_size=(model_args.ssm_size_base // pow(2, int(model_args.conj_sym))),
@@ -434,11 +462,14 @@ def main() -> int:
         n_fused_layers=model_args.n_layers,
         h_size_ema=model_args.ssm_size_base,
     )
+    hidden_init_sec = time.perf_counter() - t_hidden_init_t0
 
     rng = jax.random.key(args.seed)
     fixed_action = jnp.int32(args.agent_action)
     if args.action_policy == "fixed":
         print(f"Agent action policy (fixed): {int(fixed_action)} for {int(args.n_steps)} steps")
+    elif args.action_policy == "market_making":
+        print(f"Agent action policy (market_making): strategy-driven for {int(args.n_steps)} steps")
     else:
         print(f"Agent action policy (random): sampled each step for {int(args.n_steps)} steps")
 
@@ -452,9 +483,17 @@ def main() -> int:
     action_trace: list[int] = []
     generate_stdout_fragments: list[str] = []
 
+    per_step_total_sec: list[float] = []
+    per_step_action_sec: list[float] = []
+    per_step_generate_sec: list[float] = []
+    per_step_post_sec: list[float] = []
+
     for step_i in range(args.n_steps):
+        step_t0 = time.perf_counter()
         if args.action_policy == "fixed":
             action_this_step = fixed_action
+        elif args.action_policy == "market_making":
+            action_this_step = _select_market_making_action(mm_cfg, agent_state)
         else:
             rng, rng_action = jax.random.split(rng)
             action_this_step = jax.random.randint(
@@ -467,20 +506,25 @@ def main() -> int:
 
         step_world_state = _build_world_state(sim, current_sim_state, current_world_time)
 
-        action_msgs, _cancel_msgs, _extras = mm_agent.get_messages(
+        action_t0 = time.perf_counter()
+        action_msgs, cancel_msgs, _extras = mm_agent.get_messages(
             action_this_step,
             step_world_state,
             agent_state,
             agent_params,
         )
         # Use deterministic synthetic order ids per step for trace readability.
-        action_msgs = action_msgs.at[:, 4].set(
-            jnp.array([-9000 - (2 * step_i + 1), -9000 - (2 * step_i + 2)], dtype=jnp.int32)
-        )
+        num_action_msgs = int(action_msgs.shape[0])
+        if num_action_msgs > 0:
+            base_order_id = -9000 - (step_i * num_action_msgs)
+            action_order_ids = (base_order_id - jnp.arange(num_action_msgs, dtype=jnp.int32)).astype(jnp.int32)
+            action_msgs = action_msgs.at[:, 4].set(action_order_ids)
 
         action_msgs = _sanitize_action_msgs(action_msgs)
+        cancel_msgs = _sanitize_action_msgs(cancel_msgs)
+        combined_agent_msgs = jnp.concatenate([cancel_msgs, action_msgs], axis=0)
         bid_before, ask_before = _best_quotes(sim, current_sim_state)
-        sim_state_after_action = sim.process_orders_array(current_sim_state, action_msgs)
+        sim_state_after_action = sim.process_orders_array(current_sim_state, combined_agent_msgs)
         bid_after_action, ask_after_action = _best_quotes(sim, sim_state_after_action)
         if bid_after_action <= 0 or ask_after_action <= 0:
             # Agent action cleared one side of the book; revert to pre-action snapshot.
@@ -488,8 +532,10 @@ def main() -> int:
             sim_state_after_action = current_sim_state
             bid_after_action, ask_after_action = bid_before, ask_before
         changed = (bid_before != bid_after_action) or (ask_before != ask_after_action)
+        action_sec = time.perf_counter() - action_t0
 
         rng, rng_gen = jax.random.split(rng)
+        generate_t0 = time.perf_counter()
         model_stdout = io.StringIO()
         with contextlib.redirect_stdout(model_stdout):
             msgs_decoded, _l2_states, _num_errors, _msg_tokens = inference.generate(
@@ -511,6 +557,7 @@ def main() -> int:
                 False,
                 None,
             )
+        generate_sec = time.perf_counter() - generate_t0
         raw_generate_stdout = model_stdout.getvalue().strip()
         if raw_generate_stdout:
             generate_stdout_fragments.append(raw_generate_stdout)
@@ -518,6 +565,7 @@ def main() -> int:
                 print(raw_generate_stdout)
 
         first_msg = msgs_decoded[0]
+        post_t0 = time.perf_counter()
         gen_sim_msg = inference.msg_to_jnp(first_msg)
         sim_state_after_step = sim.process_order_array(sim_state_after_action, gen_sim_msg)
         bid_after_step, ask_after_step = _best_quotes(sim, sim_state_after_step)
@@ -580,12 +628,39 @@ def main() -> int:
 
         generated_message_rows.append([int(step_i + 1)] + jnp.asarray(first_msg).tolist())
 
+        step_pnl = _compute_agent_pnl_from_trades(
+            sim_state_after_step.trades,
+            trader_id=int(agent_params.trader_id),
+            tick_size=int(world_cfg.tick_size),
+            final_midprice=mid_after_step,
+        )
+        agent_state = MMEnvState(
+            posted_distance_bid=0,
+            posted_distance_ask=0,
+            inventory=int(round(step_pnl["inventory"])),
+            total_PnL=float(step_pnl["total_pnl"]),
+            cash_balance=float(step_pnl["cash_pnl"]),
+        )
+
+        post_sec = time.perf_counter() - post_t0
+        step_total_sec = time.perf_counter() - step_t0
+        per_step_action_sec.append(float(action_sec))
+        per_step_generate_sec.append(float(generate_sec))
+        per_step_post_sec.append(float(post_sec))
+        per_step_total_sec.append(float(step_total_sec))
+
         # Update state and time for next step.
         current_sim_state = sim_state_after_step
         msg_time_s = int(first_msg[8])
         msg_time_ns = int(first_msg[9])
         if msg_time_s >= 0 and msg_time_ns >= 0:
             current_world_time = jnp.array([msg_time_s, msg_time_ns], dtype=jnp.int32)
+
+    rollout_total_sec = float(sum(per_step_total_sec))
+    action_total_sec = float(sum(per_step_action_sec))
+    generate_total_sec = float(sum(per_step_generate_sec))
+    post_total_sec = float(sum(per_step_post_sec))
+    total_runtime_sec = float(time.perf_counter() - run_t0)
 
     _write_csv_rows(
         artifacts.action_csv,
@@ -672,8 +747,13 @@ def main() -> int:
         "sample_top_n": int(args.sample_top_n),
         "seed": int(args.seed),
         "agent_action": int(fixed_action),
-        "policy_type": "fixed_constant_action" if args.action_policy == "fixed" else "random_uniform_action",
+        "policy_type": (
+            "fixed_constant_action"
+            if args.action_policy == "fixed"
+            else ("strategy_market_making" if args.action_policy == "market_making" else "random_uniform_action")
+        ),
         "action_policy": args.action_policy,
+        "mm_action_space": mm_cfg.action_space,
         "action_space_n": int(mm_cfg.n_actions),
         "n_steps": int(args.n_steps),
         "action_trace": action_trace,
@@ -694,7 +774,43 @@ def main() -> int:
             "action_midprice_plot_png": str(artifacts.action_midprice_plot_png),
         },
         "captured_generate_stdout": "\n".join(generate_stdout_fragments),
+        "timing": {
+            "total_runtime_sec": total_runtime_sec,
+            "restore_sec": float(restore_sec),
+            "dataset_load_sec": float(dataset_load_sec),
+            "sim_init_sec": float(sim_init_sec),
+            "historical_replay_sec": float(historical_replay_sec),
+            "hidden_init_sec": float(hidden_init_sec),
+            "rollout_total_sec": rollout_total_sec,
+            "rollout_action_total_sec": action_total_sec,
+            "rollout_generate_total_sec": generate_total_sec,
+            "rollout_post_total_sec": post_total_sec,
+            "rollout_step_avg_sec": (rollout_total_sec / float(args.n_steps)) if args.n_steps > 0 else 0.0,
+            "rollout_generate_avg_sec": (generate_total_sec / float(args.n_steps)) if args.n_steps > 0 else 0.0,
+            "rollout_action_avg_sec": (action_total_sec / float(args.n_steps)) if args.n_steps > 0 else 0.0,
+            "rollout_post_avg_sec": (post_total_sec / float(args.n_steps)) if args.n_steps > 0 else 0.0,
+        },
     }
+
+    phase_totals = {
+        "rollout_generate": generate_total_sec,
+        "rollout_action": action_total_sec,
+        "rollout_post": post_total_sec,
+        "restore": float(restore_sec),
+        "dataset_load": float(dataset_load_sec),
+        "sim_init": float(sim_init_sec),
+        "historical_replay": float(historical_replay_sec),
+        "hidden_init": float(hidden_init_sec),
+    }
+    bottlenecks = sorted(phase_totals.items(), key=lambda kv: kv[1], reverse=True)
+    summary["bottlenecks"] = [
+        {
+            "phase": phase,
+            "seconds": float(sec),
+            "share_of_total_runtime_pct": float((sec / total_runtime_sec) * 100.0) if total_runtime_sec > 0 else 0.0,
+        }
+        for phase, sec in bottlenecks[:3]
+    ]
 
     # End-of-run PnL snapshot from executed trades.
     pnl = _compute_agent_pnl_from_trades(
@@ -714,7 +830,7 @@ def main() -> int:
         f"Checkpoint: {ckpt_path} (step {step})",
         f"Data dir: {data_dir}",
         f"Sample index: {idx}",
-        f"Policy: {'fixed constant action ' + str(int(fixed_action)) if args.action_policy == 'fixed' else 'random uniform over action ids'}",
+        f"Policy: {'fixed constant action ' + str(int(fixed_action)) if args.action_policy == 'fixed' else ('market-making strategy policy (bobStrategy action space)' if args.action_policy == 'market_making' else 'random uniform over action ids')}",
         f"Rollout steps: {int(args.n_steps)}",
         f"Action trace: {action_trace}",
         f"Final midprice (raw units): {summary['final_midprice']}",
@@ -724,6 +840,15 @@ def main() -> int:
         f"Agent cash PnL: {summary['agent_pnl']['cash_pnl']:.4f}",
         f"Agent inventory MTM: {summary['agent_pnl']['inventory_mark_to_market']:.4f}",
         f"Agent trade count: {int(summary['agent_pnl']['agent_trade_count'])}",
+        f"Total runtime (s): {summary['timing']['total_runtime_sec']:.3f}",
+        f"Rollout total (s): {summary['timing']['rollout_total_sec']:.3f}",
+        f"Rollout avg/step (s): {summary['timing']['rollout_step_avg_sec']:.3f}",
+        f"Generate total (s): {summary['timing']['rollout_generate_total_sec']:.3f}",
+        f"Action total (s): {summary['timing']['rollout_action_total_sec']:.3f}",
+        f"Postprocess total (s): {summary['timing']['rollout_post_total_sec']:.3f}",
+        f"Top bottleneck #1: {summary['bottlenecks'][0]['phase']} ({summary['bottlenecks'][0]['seconds']:.3f}s, {summary['bottlenecks'][0]['share_of_total_runtime_pct']:.1f}%)" if summary['bottlenecks'] else "Top bottleneck #1: n/a",
+        f"Top bottleneck #2: {summary['bottlenecks'][1]['phase']} ({summary['bottlenecks'][1]['seconds']:.3f}s, {summary['bottlenecks'][1]['share_of_total_runtime_pct']:.1f}%)" if len(summary['bottlenecks']) > 1 else "Top bottleneck #2: n/a",
+        f"Top bottleneck #3: {summary['bottlenecks'][2]['phase']} ({summary['bottlenecks'][2]['seconds']:.3f}s, {summary['bottlenecks'][2]['share_of_total_runtime_pct']:.1f}%)" if len(summary['bottlenecks']) > 2 else "Top bottleneck #3: n/a",
         "Price units: integer units where 10000 = $1.00",
         f"Historical points: {len(historical_midprices)}",
         f"Generated points: {len(generated_midprices)}",
@@ -743,6 +868,8 @@ def main() -> int:
             f"Action trace: {action_trace}",
             f"Final midprice: {summary['final_midprice']} ({summary['final_midprice_usd']:.4f} USD)",
             f"Agent total PnL: {summary['agent_pnl']['total_pnl']:.4f}",
+            f"Total runtime: {summary['timing']['total_runtime_sec']:.3f}s",
+            f"Top bottleneck: {summary['bottlenecks'][0]['phase']} ({summary['bottlenecks'][0]['seconds']:.3f}s)",
             f"Saved summary: {artifacts.summary_json}",
             f"Saved report:  {artifacts.report_txt}",
             f"Saved plot:    {artifacts.midprice_plot_png}",

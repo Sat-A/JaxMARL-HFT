@@ -161,6 +161,142 @@ Random actions can occasionally post orders with invalid (zero or negative) pric
 
 Both revert events are printed as diagnostics during the rollout.
 
+### 8. Learned-Policy World-Model Rollout
+
+`run_learned_mm_worldmodel_rollout.py` replaces the heuristic action selector with a trained IPPO/GRU policy loaded from an Orbax checkpoint. It runs full multi-step rollouts with per-step timing instrumentation and supports multiple independent trajectories in a single process.
+
+```bash
+# Smoke test — 10 steps, single trajectory
+CUDA_VISIBLE_DEVICES=0 python run_learned_mm_worldmodel_rollout.py \
+  --fast_startup \
+  --n_cond_msgs 8 \
+  --n_steps 10 \
+  --n_envs 1 \
+  --policy_deterministic \
+  --allow_obs_pad \
+  --run_name smoke_test
+```
+
+```bash
+# Throughput mode — 4 independent trajectories, single GPU
+CUDA_VISIBLE_DEVICES=0 python run_learned_mm_worldmodel_rollout.py \
+  --fast_startup \
+  --n_cond_msgs 8 \
+  --n_steps 25 \
+  --n_envs 4 \
+  --policy_deterministic \
+  --allow_obs_pad \
+  --run_name throughput_n4
+```
+
+**Key flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--policy_ckpt_dir` | `checkpoints/MARLCheckpoints/2PLayer/dummy-2vdmzbye` | Orbax checkpoint directory for the IPPO policy |
+| `--policy_config` | `config/rl_configs/ippo_rnn_JAXMARL_mm_BOB.yaml` | YAML config used during training |
+| `--policy_model_index` | `1` | Index into the model list saved in the checkpoint |
+| `--n_envs` | `1` | Number of independent parallel trajectories (sequential loop, independent state per env) |
+| `--policy_deterministic` | off | Use argmax over logits instead of sampling |
+| `--allow_obs_pad` | off | Pad/truncate observation vector if checkpoint obs dim differs from built features |
+
+**Measured throughput (A100, single GPU, n_cond_msgs=8, greedy decode):**
+
+| n_envs | agg steps/s | step p50 (ms) | peak memory |
+|-------:|------------:|--------------:|------------:|
+| 1 | 0.09 | 247 | 36.9 GB |
+| 2 | 0.17 | 266 | 36.9 GB |
+| 4 | 0.32 | 263 | 36.9 GB |
+
+Memory is dominated by the LOBS5 world model (~36.8 GB). Per-trajectory overhead is negligible, so higher `n_envs` values are expected stable. The policy GRU inference runs at ~1.7 ms per step after JIT compilation.
+
+Full Phase 4 sweep (Stage A stability probe + Stage C seed variance):
+
+```bash
+bash run_sweep_single_gpu.sh
+```
+
+Results are written under `outputs/sweep_single_gpu_<timestamp>/`.
+
+### 9. Production Deployment (Learned Policy Rollout)
+
+Use a trained policy checkpoint (not `dummy-2vdmzbye`) for quality validation and deployment decisions.
+
+```bash
+# Quality smoke (trained checkpoint, single env)
+CUDA_VISIBLE_DEVICES=0 python run_learned_mm_worldmodel_rollout.py \
+  --fast_startup \
+  --policy_ckpt_dir checkpoints/MARLCheckpoints/trained_smoke \
+  --policy_deterministic \
+  --allow_obs_pad \
+  --n_cond_msgs 8 \
+  --n_steps 25 \
+  --n_envs 1 \
+  --run_name quality_smoke_trained
+```
+
+```bash
+# Throughput candidate (replace N with highest stable n_envs from sweep)
+CUDA_VISIBLE_DEVICES=0 python run_learned_mm_worldmodel_rollout.py \
+  --fast_startup \
+  --policy_ckpt_dir checkpoints/MARLCheckpoints/trained_smoke \
+  --policy_deterministic \
+  --allow_obs_pad \
+  --n_cond_msgs 8 \
+  --n_steps 50 \
+  --n_envs N \
+  --jit_message_build \
+  --run_name prod_candidate_nN
+```
+
+```bash
+# Sweep to OOM/stability boundary (now probes 1,2,4,8,16,32)
+bash run_sweep_single_gpu.sh
+```
+
+Notes:
+- `--jit_message_build` is opt-in and falls back to eager message-build automatically if JIT compile fails.
+- Production `n_envs` should be selected as highest stable throughput setting with quality guardrails (action diversity + trade incidence > 0).
+
+### 10. Supercomputer Multi-Node Kickoff (Tomorrow)
+
+Start with this order on a stronger multi-node cluster:
+
+1. **Single-node validation first (15-30 min)**
+  - Confirm environment + paths + checkpoint access on one node.
+  - Run one short real-checkpoint quality baseline:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run_learned_mm_worldmodel_rollout.py \
+  --fast_startup \
+  --policy_ckpt_dir /scratch/local/homes/groups/finance/data/checkpoints/MARLCheckpoints/2PLayer/whole-sweep-1 \
+  --policy_deterministic \
+  --allow_obs_pad \
+  --jit_message_build \
+  --n_cond_msgs 8 \
+  --n_steps 50 \
+  --n_envs 1 \
+  --seed 42 \
+  --run_name sc_quality_seed42
+```
+
+2. **Single-node throughput boundary**
+  - Reconfirm stable max on the new GPU type:
+
+```bash
+POLICY_CKPT_DIR=/scratch/local/homes/groups/finance/data/checkpoints/MARLCheckpoints/2PLayer/whole-sweep-1 \
+JIT_MESSAGE_BUILD=1 N_STEPS=25 N_COND_MSGS=8 GPU_ID=0 \
+bash run_sweep_single_gpu.sh
+```
+
+3. **Then scale out across nodes**
+  - Launch one process per GPU, each with the same stable `n_envs` and distinct `--seed`/`--sample_index` ranges.
+  - Keep each process long-lived to amortize JAX warmup.
+  - Aggregate all `summary.json` files under `outputs/` and compare throughput + variance.
+
+Practical default for tomorrow:
+- Start from `n_envs=32` + `--jit_message_build` (current best throughput on this setup), then tune upward/downward per GPU memory and stability on the new node.
+
 ## Docker Setup (alternative)
 
 For **x86_64/amd64 only** (base image: `nvcr.io/nvidia/jax`). Edit the `Makefile` to set `DATADIR` to your LOBSTER data directory, then:
