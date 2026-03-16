@@ -122,3 +122,9 @@ pre_reset_states/**
 trajectories/
 trajectories/**
 lobs5_checkpoints/
+
+# Cluster/runtime local artifacts
+core
+core.*
+slurm/logs/
+slurm/logs/**

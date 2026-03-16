@@ -36,6 +36,7 @@ from run_one_step_inference import (
     _ensure_model_args_defaults,
     _latest_checkpoint_step,
     _load_metadata_robust,
+    _prepare_date_filtered_data_dir,
     _restore_params_only,
 )
 from minimal_agent_generative_step import (
@@ -51,11 +52,18 @@ from gymnax_exchange.jaxrl.MARL.baseline_eval.baseline_JAXMARL import ActorCriti
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_LOBS5_ROOT = Path("/homes/80/satyam/LOBS5")
-DEFAULT_LOBS5_CKPT = Path(
-    "/scratch/local/homes/groups/finance/data/checkpoints/lobs5_v2/twilight-sound-77_s42sujip"
+DEFAULT_LOBS5_ROOT = Path(
+    os.environ.get("LOBS5_ROOT", "/home/s5e/satyamaga.s5e/LOBS5")
 )
-DEFAULT_DATA = Path("/scratch/local/homes/groups/finance/data/processed_data/GOOG/2022")
+DEFAULT_LOBS5_CKPT = Path(
+    os.environ.get(
+        "WORLD_MODEL_CKPT",
+        "/lus/lfs1aip2/projects/s5e/quant/AlphaTrade/experiments/exp_H1-scaling-law/checkpoints/j2514440_bkotgtm5_2514440",
+    )
+)
+DEFAULT_DATA = Path(
+    os.environ.get("LOB_PREPROC_DATA_DIR", "/lus/lfs1aip2/projects/s5e/lob_preproc/GOOG")
+)
 DEFAULT_MARL_CKPT = REPO_ROOT / "checkpoints" / "MARLCheckpoints" / "2PLayer" / "dummy-2vdmzbye"
 DEFAULT_MARL_CONFIG = REPO_ROOT / "config" / "rl_configs" / "ippo_rnn_JAXMARL_mm_BOB.yaml"
 
@@ -264,6 +272,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_steps", type=int, default=25, help="Rollout steps")
     parser.add_argument("--seed", type=int, default=42, help="PRNG seed")
     parser.add_argument("--test_split", type=float, default=1.0, help="Dataset split fraction")
+    parser.add_argument("--start_date", default="2026-01-01", help="Inclusive start date filter (YYYY-MM-DD)")
+    parser.add_argument("--end_date", default="2026-01-31", help="Inclusive end date filter (YYYY-MM-DD)")
 
     parser.add_argument("--policy_ckpt_dir", default=str(DEFAULT_MARL_CKPT), help="Learned policy checkpoint dir")
     parser.add_argument("--policy_config", default=str(DEFAULT_MARL_CONFIG), help="Policy YAML config")
@@ -431,8 +441,9 @@ def main() -> int:
     model = model_cls(training=False, step_rescale=1.0)
 
     t_dataset_t0 = time.perf_counter()
+    selected_data_dir, temp_data_ctx = _prepare_date_filtered_data_dir(data_dir, args.start_date, args.end_date)
     ds = inference.get_dataset(
-        str(data_dir),
+        str(selected_data_dir),
         args.n_cond_msgs,
         n_eval_messages,
         test_split=args.test_split,
@@ -735,6 +746,10 @@ def main() -> int:
         "checkpoint_path": str(ckpt_path),
         "policy_checkpoint_dir": str(policy_ckpt_dir),
         "policy_config": str(policy_config),
+        "data_dir": str(data_dir),
+        "dataset_effective_dir": str(selected_data_dir),
+        "start_date": args.start_date,
+        "end_date": args.end_date,
         "sample_index": int(idx),
         "seed": int(args.seed),
         "n_steps": int(args.n_steps),
@@ -802,6 +817,8 @@ def main() -> int:
         f"p95={summary['timing_breakdown']['step_latency_ms_p95']:.2f}ms"
     )
     print("=" * 80)
+    if temp_data_ctx is not None:
+        temp_data_ctx.cleanup()
     return 0
 
 

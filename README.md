@@ -258,44 +258,46 @@ Notes:
 - `--jit_message_build` is opt-in and falls back to eager message-build automatically if JIT compile fails.
 - Production `n_envs` should be selected as highest stable throughput setting with quality guardrails (action diversity + trade incidence > 0).
 
-### 10. Supercomputer Multi-Node Kickoff (Tomorrow)
+### 10. Slurm Cluster Quickstart (single node, max 5 jobs)
 
-Start with this order on a stronger multi-node cluster:
+Current cluster defaults used by scripts:
 
-1. **Single-node validation first (15-30 min)**
-  - Confirm environment + paths + checkpoint access on one node.
-  - Run one short real-checkpoint quality baseline:
+- LOBS5 repo: `/home/s5e/satyamaga.s5e/LOBS5`
+- World-model checkpoint: `/lus/lfs1aip2/projects/s5e/quant/AlphaTrade/experiments/exp_H1-scaling-law/checkpoints/j2514440_bkotgtm5_2514440`
+- Dataset root: `/lus/lfs1aip2/projects/s5e/lob_preproc/GOOG`
+- Test date window: `2026-01-01` to `2026-01-31` (enforced via `--start_date/--end_date`)
+
+Use Slurm scripts in `slurm/`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python run_learned_mm_worldmodel_rollout.py \
+# submit bounded smoke suite (never submits beyond 5 active jobs total)
+bash slurm/submit_smoke_jobs.sh
+```
+
+```bash
+# single-node rollout smoke only
+sbatch slurm/sbatch_smoke_worldmodel_rollout.sh
+```
+
+```bash
+# single-node training smoke only
+sbatch slurm/sbatch_smoke_train.sh
+```
+
+For manual rollout invocation:
+
+```bash
+python run_learned_mm_worldmodel_rollout.py \
   --fast_startup \
-  --policy_ckpt_dir /scratch/local/homes/groups/finance/data/checkpoints/MARLCheckpoints/2PLayer/whole-sweep-1 \
+  --n_cond_msgs 8 \
+  --n_steps 10 \
+  --n_envs 1 \
+  --start_date 2026-01-01 \
+  --end_date 2026-01-31 \
   --policy_deterministic \
   --allow_obs_pad \
-  --jit_message_build \
-  --n_cond_msgs 8 \
-  --n_steps 50 \
-  --n_envs 1 \
-  --seed 42 \
-  --run_name sc_quality_seed42
+  --run_name cluster_smoke_manual
 ```
-
-2. **Single-node throughput boundary**
-  - Reconfirm stable max on the new GPU type:
-
-```bash
-POLICY_CKPT_DIR=/scratch/local/homes/groups/finance/data/checkpoints/MARLCheckpoints/2PLayer/whole-sweep-1 \
-JIT_MESSAGE_BUILD=1 N_STEPS=25 N_COND_MSGS=8 GPU_ID=0 \
-bash run_sweep_single_gpu.sh
-```
-
-3. **Then scale out across nodes**
-  - Launch one process per GPU, each with the same stable `n_envs` and distinct `--seed`/`--sample_index` ranges.
-  - Keep each process long-lived to amortize JAX warmup.
-  - Aggregate all `summary.json` files under `outputs/` and compare throughput + variance.
-
-Practical default for tomorrow:
-- Start from `n_envs=32` + `--jit_message_build` (current best throughput on this setup), then tune upward/downward per GPU memory and stability on the new node.
 
 ## Docker Setup (alternative)
 

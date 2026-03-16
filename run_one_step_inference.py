@@ -8,11 +8,14 @@ This script lives in JaxMARL-HFT but reuses LOBS5 inference modules from:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import importlib
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from glob import glob
 from pathlib import Path
@@ -24,7 +27,9 @@ import pandas as pd
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_LOBS5_ROOT = Path("/homes/80/satyam/LOBS5")
+DEFAULT_LOBS5_ROOT = Path(
+    os.environ.get("LOBS5_ROOT", "/home/s5e/satyamaga.s5e/LOBS5")
+)
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "one_step_runs"
 
 
@@ -49,7 +54,35 @@ def _restore_params_only(ckpt_path: Path, step: int):
     state_dir = ckpt_path / str(step) / "state"
     if not state_dir.is_dir():
         raise FileNotFoundError(f"Checkpoint state directory not found: {state_dir}")
-    restored = ocp.PyTreeCheckpointer().restore(str(state_dir))
+    checkpointer = ocp.PyTreeCheckpointer()
+    try:
+        restored = checkpointer.restore(str(state_dir))
+    except ValueError as exc:
+        if "sharding passed to deserialization" not in str(exc):
+            raise
+        # Some checkpoints were saved with multi-device shardings; remap restore
+        # to the currently available single device when topology differs.
+        meta_tree = checkpointer.metadata(str(state_dir)).tree
+        single = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+        def _to_struct(x):
+            if x is None:
+                return None
+            if hasattr(x, "shape") and hasattr(x, "dtype"):
+                return jax.ShapeDtypeStruct(shape=tuple(x.shape), dtype=jnp.dtype(x.dtype), sharding=single)
+            return x
+
+        def _to_restore_arg(x):
+            if isinstance(x, jax.ShapeDtypeStruct):
+                return ocp.ArrayRestoreArgs(sharding=single)
+            return None
+
+        target = jax.tree_util.tree_map(_to_struct, meta_tree)
+        restore_args = jax.tree_util.tree_map(_to_restore_arg, target)
+        restored = checkpointer.restore(
+            str(state_dir),
+            args=ocp.args.PyTreeRestore(item=target, restore_args=restore_args),
+        )
     if not isinstance(restored, dict) or "params" not in restored:
         raise RuntimeError(f"Unexpected checkpoint state format in {state_dir}")
     return restored["params"]
@@ -234,6 +267,83 @@ def _default_run_name() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
+def _parse_iso_date(date_str: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(date_str)
+    except ValueError as exc:
+        raise ValueError(f"Invalid date '{date_str}'. Expected YYYY-MM-DD.") from exc
+
+
+def _extract_date_from_path(path: Path) -> dt.date | None:
+    m = re.search(r"(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)", path.name)
+    if not m:
+        return None
+    try:
+        return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _prepare_date_filtered_data_dir(
+    data_dir: Path,
+    start_date: str,
+    end_date: str,
+) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
+    start_raw = start_date.strip()
+    end_raw = end_date.strip()
+    if not start_raw and not end_raw:
+        return data_dir, None
+    if not start_raw or not end_raw:
+        raise ValueError("Both --start_date and --end_date are required when applying date filtering.")
+
+    start = _parse_iso_date(start_raw)
+    end = _parse_iso_date(end_raw)
+    if start > end:
+        raise ValueError(f"Invalid date range: start_date {start} is after end_date {end}.")
+
+    msg_files = sorted(Path(p) for p in glob(str(data_dir / "*message*.npy")))
+    book_files = sorted(
+        [Path(p) for p in glob(str(data_dir / "*book*.npy"))]
+        + [Path(p) for p in glob(str(data_dir / "*orderbook*.npy"))]
+    )
+    if not msg_files or not book_files:
+        raise FileNotFoundError(f"Expected message/book npy files in {data_dir}")
+
+    books_by_date: dict[dt.date, list[Path]] = {}
+    for bf in book_files:
+        d = _extract_date_from_path(bf)
+        if d is None:
+            continue
+        books_by_date.setdefault(d, []).append(bf)
+
+    selected_msgs: list[Path] = []
+    selected_books: list[Path] = []
+    for mf in msg_files:
+        d = _extract_date_from_path(mf)
+        if d is None or d < start or d > end:
+            continue
+        b_candidates = books_by_date.get(d, [])
+        if not b_candidates:
+            continue
+        selected_msgs.append(mf)
+        selected_books.append(sorted(b_candidates)[0])
+
+    if not selected_msgs:
+        raise RuntimeError(
+            f"No dated message/book pairs found in {data_dir} for range {start.isoformat()} to {end.isoformat()}."
+        )
+
+    tmp = tempfile.TemporaryDirectory(prefix="lob_date_filter_")
+    tmp_path = Path(tmp.name)
+    for src in [*selected_msgs, *selected_books]:
+        dst = tmp_path / src.name
+        try:
+            os.symlink(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+    return tmp_path, tmp
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="One-message LOBS5 inference and CSV export")
     parser.add_argument("--ckpt_path", required=True, help="Checkpoint dir path")
@@ -256,6 +366,8 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated dataset indices to run in one process (compile amortization)",
     )
     parser.add_argument("--test_split", type=float, default=1.0, help="Fraction of files to include from tail")
+    parser.add_argument("--start_date", default="", help="Optional inclusive start date filter (YYYY-MM-DD)")
+    parser.add_argument("--end_date", default="", help="Optional inclusive end date filter (YYYY-MM-DD)")
     parser.add_argument("--seed", type=int, default=42, help="JAX random seed")
     parser.add_argument("--n_samples", type=int, default=1, help="Number of samples to run in this invocation")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for parallel generation in one invocation")
@@ -309,12 +421,13 @@ def main() -> int:
     if not lobs5_root.exists() or not lobs5_root.is_dir():
         raise FileNotFoundError(f"LOBS5 root not found: {lobs5_root}")
 
-    msg_files = glob(str(data_dir / "*message*.npy"))
-    book_files = glob(str(data_dir / "*book*.npy")) + glob(str(data_dir / "*orderbook*.npy"))
+    selected_data_dir, temp_data_ctx = _prepare_date_filtered_data_dir(data_dir, args.start_date, args.end_date)
+    msg_files = glob(str(selected_data_dir / "*message*.npy"))
+    book_files = glob(str(selected_data_dir / "*book*.npy")) + glob(str(selected_data_dir / "*orderbook*.npy"))
     if not msg_files:
-        raise FileNotFoundError(f"No *message*.npy files found in {data_dir}")
+        raise FileNotFoundError(f"No *message*.npy files found in {selected_data_dir}")
     if not book_files:
-        raise FileNotFoundError(f"No *book*.npy or *orderbook*.npy files found in {data_dir}")
+        raise FileNotFoundError(f"No *book*.npy or *orderbook*.npy files found in {selected_data_dir}")
 
     t1 = time.time()
     step = args.checkpoint_step if args.checkpoint_step is not None else _latest_checkpoint_step(ckpt_path)
@@ -366,7 +479,7 @@ def main() -> int:
 
     t4 = time.time()
     ds = inference.get_dataset(
-        str(data_dir),
+        str(selected_data_dir),
         args.n_cond_msgs,
         n_eval_messages,
         test_split=args.test_split,
@@ -514,6 +627,9 @@ def main() -> int:
         "checkpoint_path": str(ckpt_path),
         "checkpoint_step": int(step),
         "data_dir": str(data_dir),
+        "dataset_effective_dir": str(selected_data_dir),
+        "start_date": args.start_date,
+        "end_date": args.end_date,
         "stock": args.stock,
         "sample_index": int(selected_indices[0]),
         "sample_indices": [int(i) for i in selected_indices],
@@ -550,6 +666,8 @@ def main() -> int:
     print(f"Total time:  {total_runtime:.3f}s")
     print("==============================================")
 
+    if temp_data_ctx is not None:
+        temp_data_ctx.cleanup()
     return 0
 
 

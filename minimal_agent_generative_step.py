@@ -33,16 +33,24 @@ from run_one_step_inference import (
     _ensure_model_args_defaults,
     _latest_checkpoint_step,
     _load_metadata_robust,
+    _prepare_date_filtered_data_dir,
     _restore_params_only,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_LOBS5_ROOT = Path("/homes/80/satyam/LOBS5")
-DEFAULT_CKPT = Path(
-    "/scratch/local/homes/groups/finance/data/checkpoints/lobs5_v2/twilight-sound-77_s42sujip"
+DEFAULT_LOBS5_ROOT = Path(
+    os.environ.get("LOBS5_ROOT", "/home/s5e/satyamaga.s5e/LOBS5")
 )
-DEFAULT_DATA = Path("/scratch/local/homes/groups/finance/data/processed_data/GOOG/2022")
+DEFAULT_CKPT = Path(
+    os.environ.get(
+        "WORLD_MODEL_CKPT",
+        "/lus/lfs1aip2/projects/s5e/quant/AlphaTrade/experiments/exp_H1-scaling-law/checkpoints/j2514440_bkotgtm5_2514440",
+    )
+)
+DEFAULT_DATA = Path(
+    os.environ.get("LOB_PREPROC_DATA_DIR", "/lus/lfs1aip2/projects/s5e/lob_preproc/GOOG")
+)
 
 
 @dataclass
@@ -76,6 +84,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42, help="PRNG seed")
     parser.add_argument("--test_split", type=float, default=1.0, help="Dataset split fraction")
+    parser.add_argument("--start_date", default="", help="Optional inclusive start date filter (YYYY-MM-DD)")
+    parser.add_argument("--end_date", default="", help="Optional inclusive end date filter (YYYY-MM-DD)")
     parser.add_argument(
         "--compile_cache_dir",
         default=str(REPO_ROOT / ".cache" / "jax_compilation"),
@@ -389,8 +399,9 @@ def main() -> int:
     model = model_cls(training=False, step_rescale=1.0)
 
     t_dataset_t0 = time.perf_counter()
+    selected_data_dir, temp_data_ctx = _prepare_date_filtered_data_dir(data_dir, args.start_date, args.end_date)
     ds = inference.get_dataset(
-        str(data_dir),
+        str(selected_data_dir),
         args.n_cond_msgs,
         n_eval_messages,
         test_split=args.test_split,
@@ -742,6 +753,9 @@ def main() -> int:
         "checkpoint_path": str(ckpt_path),
         "checkpoint_step": int(step),
         "data_dir": str(data_dir),
+        "dataset_effective_dir": str(selected_data_dir),
+        "start_date": args.start_date,
+        "end_date": args.end_date,
         "sample_index": int(idx),
         "n_cond_msgs": int(args.n_cond_msgs),
         "sample_top_n": int(args.sample_top_n),
@@ -877,6 +891,8 @@ def main() -> int:
         ],
     )
 
+    if temp_data_ctx is not None:
+        temp_data_ctx.cleanup()
     return 0
 
 

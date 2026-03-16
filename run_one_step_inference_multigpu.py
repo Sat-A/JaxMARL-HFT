@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_LOBS5_ROOT = os.environ.get("LOBS5_ROOT", "/home/s5e/satyamaga.s5e/LOBS5")
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_dir", required=True)
     p.add_argument("--stock", default="GOOG")
     p.add_argument("--checkpoint_step", type=int, default=None)
-    p.add_argument("--lobs5_root", default="/homes/80/satyam/LOBS5")
+    p.add_argument("--lobs5_root", default=DEFAULT_LOBS5_ROOT)
     p.add_argument("--output_root", default=str(REPO_ROOT / "outputs" / "one_step_runs"))
     p.add_argument("--run_name_prefix", default="multigpu")
     p.add_argument("--sample_indices", default="0,1,2,3", help="Comma-separated dataset indices")
@@ -32,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_cond_msgs", type=int, default=500)
     p.add_argument("--sample_top_n", type=int, default=1)
     p.add_argument("--test_split", type=float, default=1.0)
+    p.add_argument("--start_date", default="", help="Optional inclusive start date filter (YYYY-MM-DD)")
+    p.add_argument("--end_date", default="", help="Optional inclusive end date filter (YYYY-MM-DD)")
     p.add_argument("--seed_base", type=int, default=42)
     p.add_argument("--fast_startup", action="store_true")
     p.add_argument("--compile_cache_dir", default=str(REPO_ROOT / ".cache" / "jax_compilation"))
@@ -78,6 +81,10 @@ def main() -> int:
             str(args.sample_top_n),
             "--test_split",
             str(args.test_split),
+            "--start_date",
+            args.start_date,
+            "--end_date",
+            args.end_date,
             "--seed",
             str(args.seed_base + rank),
             "--n_samples",

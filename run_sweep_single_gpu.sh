@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-PYTHON="${PYTHON:-/homes/80/satyam/miniconda3/envs/jaxmarl_hft/bin/python}"
+PYTHON="${PYTHON:-python3.11}"
 SCRIPT="run_learned_mm_worldmodel_rollout.py"
 GPU_ID="${GPU_ID:-0}"
 N_STEPS="${N_STEPS:-25}"        # enough steps for steady-state signal (>10)
@@ -15,6 +15,11 @@ N_COND_MSGS="${N_COND_MSGS:-8}"
 SAMPLE_TOP_N="${SAMPLE_TOP_N:-1}"
 SAMPLE_INDEX="${SAMPLE_INDEX:-0}"
 POLICY_CKPT_DIR="${POLICY_CKPT_DIR:-}"
+WM_CKPT_PATH="${WM_CKPT_PATH:-/lus/lfs1aip2/projects/s5e/quant/AlphaTrade/experiments/exp_H1-scaling-law/checkpoints/j2514440_bkotgtm5_2514440}"
+DATA_DIR="${DATA_DIR:-/lus/lfs1aip2/projects/s5e/lob_preproc/GOOG}"
+LOBS5_ROOT="${LOBS5_ROOT:-/home/s5e/satyamaga.s5e/LOBS5}"
+START_DATE="${START_DATE:-2026-01-01}"
+END_DATE="${END_DATE:-2026-01-31}"
 JIT_MESSAGE_BUILD="${JIT_MESSAGE_BUILD:-0}"
 RESULTS_DIR="outputs/sweep_single_gpu_$(date +%Y%m%d_%H%M%S)"
 
@@ -29,6 +34,13 @@ run_config() {
     local run_name="sweep_n${n_envs}_s${seed}"
     local jit_flag=""
     local policy_ckpt_args=()
+    local wm_args=(
+      --ckpt_path "${WM_CKPT_PATH}"
+      --data_dir "${DATA_DIR}"
+      --lobs5_root "${LOBS5_ROOT}"
+      --start_date "${START_DATE}"
+      --end_date "${END_DATE}"
+    )
 
     if [[ "${JIT_MESSAGE_BUILD}" == "1" ]]; then
         jit_flag="--jit_message_build"
@@ -52,6 +64,7 @@ run_config() {
             --policy_deterministic \
             --allow_obs_pad \
             --n_envs "${n_envs}" \
+            "${wm_args[@]}" \
             "${policy_ckpt_args[@]}" \
             ${jit_flag} \
             --run_name "${run_name}" \
