@@ -281,7 +281,17 @@ sbatch slurm/sbatch_smoke_worldmodel_rollout.sh
 
 ```bash
 # single-node training smoke only
-sbatch slurm/sbatch_smoke_train.sh
+sbatch slurm/sbatch_smoke_gen_worldmodel_train.sh
+```
+
+```bash
+# single-node 4-GPU throughput sweep for generative-world-model training
+sbatch slurm/sbatch_sweep_gen_worldmodel_single_node.sh
+```
+
+```bash
+# train generative-world-model policy with best profile (set N_ENVS_BEST from sweep)
+N_ENVS_BEST=8 sbatch slurm/sbatch_train_gen_worldmodel_best.sh
 ```
 
 For manual rollout invocation:
@@ -298,6 +308,26 @@ python run_learned_mm_worldmodel_rollout.py \
   --allow_obs_pad \
   --run_name cluster_smoke_manual
 ```
+
+For direct generative-world-model policy training (policy-gradient baseline):
+
+```bash
+python run_gen_worldmodel_pg_train.py \
+  --fast_startup \
+  --n_envs 4 \
+  --n_updates 5 \
+  --n_steps 10 \
+  --start_date 2026-01-01 \
+  --end_date 2026-01-31 \
+  --run_name gen_train_smoke
+```
+
+Latest verified cluster snapshot (2026-03-16):
+
+- Successful Slurm smoke rollout and smoke generative training completed.
+- Single-node 4-GPU throughput sweep and best-profile multi-seed training completed.
+- Best currently observed throughput profile in the generative trainer is `n_envs=1` with `mean_steps_per_sec ~ 5.67` in the longer run set.
+- Current training runs are infrastructure-valid, but policy quality remains immature (`avg_pnl_total ~ 0.0` in current runs), so longer schedules and reward/behavior tuning are still required.
 
 ## Docker Setup (alternative)
 

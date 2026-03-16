@@ -51,7 +51,7 @@ sbatch slurm/sbatch_smoke_worldmodel_rollout.sh
 
 ```bash
 # training smoke
-sbatch slurm/sbatch_smoke_train.sh
+sbatch slurm/sbatch_smoke_gen_worldmodel_train.sh
 ```
 
 ## Direct Script Smoke (without Slurm wrapper)
@@ -75,8 +75,22 @@ python run_learned_mm_worldmodel_rollout.py \
 - Use **one node per job**.
 - Keep **at most 5 active jobs** at a time.
 
+## Latest Verified Run Snapshot (2026-03-16)
+
+- Throughput and training pipeline are operational on the cluster.
+- Best observed profile in current generative training runs: `n_envs=1`, `mean_steps_per_sec ~ 5.67`.
+- Current aggregate training PnL is still near zero in short/medium runs; this is now a learning-quality problem rather than an infrastructure problem.
+
 ## Next Optimization Targets
 
 - Reduce message-build overhead in rollout loop.
 - Add persistent worker mode for repeated inference requests.
 - Extend quality checks once trained policy checkpoints are selected for production candidates.
+
+## Next Steps: Large-Scale Multi-Node Training (Short Note)
+
+1. Lock single-node profile first (`n_envs`, `n_steps`, `n_cond_msgs`) from `sbatch_sweep_gen_worldmodel_single_node.sh`.
+2. Scale out by launching one training process per GPU on each node with disjoint seeds.
+3. Keep world-model and policy checkpoint paths immutable across nodes to avoid config drift.
+4. Aggregate per-run `summary.json` using `aggregate_gen_worldmodel_pnl.py` into node-level and global reports.
+5. Promote settings only when both throughput and mean PnL remain stable under multi-node variance.

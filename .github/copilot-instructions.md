@@ -25,6 +25,11 @@ pip install -r requirements.txt
 - Test date window: `2026-01-01` to `2026-01-31` (use `--start_date/--end_date`)
 - Slurm constraints: one node per job, max 5 active jobs.
 
+**Current operational status (2026-03-16):**
+- Cluster smoke rollout and smoke generative training are validated.
+- Single-node 4-GPU sweep + best-profile multi-seed training pipeline is validated.
+- Current best throughput profile in generative training: `n_envs=1` (longer run set).
+
 ## High-Level Architecture
 
 ### Three-Layer Environment Stack
@@ -173,6 +178,16 @@ python run_learned_mm_worldmodel_rollout.py \
 ```bash
 bash run_sweep_single_gpu.sh
 ```
+
+**Generative-world-model policy training (PG baseline):**
+```bash
+python run_gen_worldmodel_pg_train.py --fast_startup --n_envs 4 --n_updates 5 --n_steps 10
+```
+
+**Single-node 4-GPU sweep + train scripts:**
+- `slurm/sbatch_sweep_gen_worldmodel_single_node.sh`
+- `slurm/sbatch_train_gen_worldmodel_best.sh`
+- `aggregate_gen_worldmodel_pnl.py` for mean/median/std PnL summaries
 
 ## Testing & Linting
 
