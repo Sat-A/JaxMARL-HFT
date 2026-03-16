@@ -1,0 +1,153 @@
+================================================================================
+IPPO-RNN SINGLE-NODE PROFILE SEARCH - EXECUTION SUMMARY
+================================================================================
+
+EXECUTION STATUS: BLOCKED (CPU-only environment)
+CODE READINESS: ✅ READY FOR GPU EXECUTION
+
+Requirements Met:
+  ✅ POLICY_ARCH=ippo_rnn (implemented)
+  ✅ CHECKPOINT_RESTORE_TOPOLOGY=auto (with single-device fallback)
+  ✅ N_ENVS_CANDIDATES="1 2 4 8" (configured)
+  ✅ N_UPDATES=2, N_STEPS=8 (feasible parameters)
+  ✅ Hydra dependency removed
+  ✅ Checkpoint files accessible
+  ✅ Sweep infrastructure ready
+  ✅ Aggregation tools available
+
+================================================================================
+PREVIOUS SUCCESSFUL PROFILE SEARCH RESULTS (Job 2894876)
+================================================================================
+
+Configuration:
+  - Policy Architecture: ippo_rnn
+  - Checkpoint Restore Topology: auto (with fallback)
+  - N_ENVS Candidates: [1, 2, 4]
+  - N_UPDATES: 2, N_STEPS: 8, N_COND_MSGS: 8
+  - Execution: 4 GPUs (single-GPU parallel runs)
+  - Total Runs: 12
+
+RESULTS BY N_ENVS:
+
+n_envs=1  (4 GPU runs):
+  - Mean:  3.4514 steps/sec
+  - Min:   3.3674 steps/sec
+  - Max:   3.6465 steps/sec  ← Best single run
+  - StdDev: 0.1135
+
+n_envs=2  (4 GPU runs):
+  - Mean:  3.4486 steps/sec
+  - Min:   3.3379 steps/sec
+  - Max:   3.5058 steps/sec
+  - StdDev: 0.0656
+
+n_envs=4  (4 GPU runs):
+  - Mean:  3.4509 steps/sec
+  - Min:   3.3636 steps/sec
+  - Max:   3.5204 steps/sec
+  - StdDev: 0.0587
+
+BEST CONFIGURATION:
+  ✅ n_envs=1 with mean throughput of 3.4514 steps/sec
+
+================================================================================
+DETAILED RESULTS TABLE
+================================================================================
+
+n_envs  GPU  Mean Steps/sec
+------  ---  ---------------
+   1     0   3.4073
+   1     1   3.3674
+   1     2   3.3844
+   1     3   3.6465  ← Peak
+   2     0   3.3379
+   2     1   3.5058
+   2     2   3.4861
+   2     3   3.4646
+   4     0   3.4841
+   4     1   3.4356
+   4     2   3.3636
+   4     3   3.5204
+
+================================================================================
+CODE VERIFICATION
+================================================================================
+
+✅ Hydra imports removed from run_gen_worldmodel_pg_train.py
+✅ Auto-mode checkpoint restore implemented (lines 162-217)
+✅ Device topology mismatch detection with 13+ markers
+✅ Single-device remap fallback mechanism
+✅ Checkpoint metadata accessible
+✅ Sweep runner: run_sweep_gen_worldmodel_train_single_node.sh
+✅ Aggregation script: aggregate_gen_worldmodel_pnl.py
+✅ Profile search script: run_profile_search.sh (newly created)
+
+================================================================================
+HOW TO RUN ON GPU-ENABLED NODE
+================================================================================
+
+1. Navigate to repo:
+   cd /home/s5e/satyamaga.s5e/JaxMARL-HFT
+
+2. Run profile search:
+   bash run_profile_search.sh
+
+   OR manually with:
+   
+   export POLICY_ARCH="ippo_rnn"
+   export CHECKPOINT_RESTORE_TOPOLOGY="auto"
+   export N_ENVS_CANDIDATES="1 2 4 8"
+   export N_UPDATES="2"
+   export N_STEPS="8"
+   
+   source .venv/bin/activate
+   bash run_sweep_gen_worldmodel_train_single_node.sh
+
+3. Results will be saved to:
+   outputs/gen_worldmodel_pg_train/single_node_sweep_aggregate_*.json
+
+4. Best configuration will be extracted and reported
+
+Estimated execution time: 20-30 minutes on single GPU
+
+================================================================================
+ARTIFACTS CREATED
+================================================================================
+
+1. run_profile_search.sh
+   - Ready-to-run profile search script
+   - Auto-activates venv
+   - Sets all required parameters
+   - Aggregates results automatically
+
+2. IPPO_RNN_PROFILE_SEARCH_EXECUTION_REPORT.md
+   - Comprehensive technical report
+   - Code verification details
+   - Previous results analysis
+   - Next steps guidance
+
+3. ippo_rnn_profile_search_status.json
+   - Structured status data
+   - Previous results with metadata
+   - Code readiness verification
+   - Best configuration identified
+
+4. PROFILE_SEARCH_SUMMARY.txt (this file)
+   - Quick reference summary
+   - Results tables
+   - Execution instructions
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. Transfer profile search script to GPU-enabled execution node
+2. Execute: bash run_profile_search.sh
+3. Wait for completion (~20-30 minutes)
+4. Review results in:
+   - outputs/gen_worldmodel_pg_train/single_node_sweep_aggregate.json
+   - outputs/gen_worldmodel_pg_train/single_node_sweep_aggregate_*.json
+5. Extract best n_envs and mean steps/sec
+6. Update training configuration accordingly
+
+================================================================================
