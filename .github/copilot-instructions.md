@@ -27,8 +27,12 @@ pip install -r requirements.txt
 
 **Current operational status (2026-03-16):**
 - Cluster smoke rollout and smoke generative training are validated.
-- Single-node 4-GPU sweep + best-profile multi-seed training pipeline is validated.
-- Current best throughput profile in generative training: `n_envs=1` (longer run set).
+- Historical single-node sweep snapshot shows best observed generative throughput profile: `n_envs=1`.
+- Current IPPO-on-generative integration work is in-progress:
+  - checkpoint restore topology handling added (`auto|strict|single-device-remap`),
+  - local recurrent `ippo_rnn` path added to generative trainer to avoid `hydra` import dependency,
+  - resilient/resumable sweep controls added (`MAX_PARALLEL_GPUS`, `RESUME_SWEEP`, `RETRY_PER_PROFILE`).
+- Latest resilient sweep attempts are still unstable and may fail before producing fresh aggregate summaries; treat profile lock-in as pending until new aggregate JSON is generated.
 
 ## High-Level Architecture
 
@@ -189,6 +193,23 @@ python run_gen_worldmodel_pg_train.py --fast_startup --n_envs 4 --n_updates 5 --
 - `slurm/sbatch_train_gen_worldmodel_best.sh`
 - `aggregate_gen_worldmodel_pnl.py` for mean/median/std PnL summaries
 
+**Resilient sweep invocation (recommended while debugging instability):**
+```bash
+MAX_PARALLEL_GPUS=1 \
+RESUME_SWEEP=1 \
+CHECKPOINT_RESTORE_TOPOLOGY=auto \
+sbatch slurm/sbatch_sweep_gen_worldmodel_single_node.sh
+```
+
+**Single-profile control run (first-line diagnostic):**
+```bash
+GPU_ID=0 \
+N_ENVS_CANDIDATES="1" \
+CHECKPOINT_RESTORE_TOPOLOGY=single-device-remap \
+POLICY_ARCH=ippo_rnn \
+bash run_sweep_gen_worldmodel_train_single_node.sh
+```
+
 ## Testing & Linting
 
 **No standard test suite exists** — testing is primarily through integration verification scripts:
@@ -249,6 +270,6 @@ make ppo_2player gpu=0               # Run 2-player training on GPU 0
 
 - **README.md**: Public-facing setup, data requirements, and run commands.
 - **This file (`.github/copilot-instructions.md`)**: Canonical internal engineering guidance (includes the former quick-guide content).
-- **INFERENCE_SPEED_LESSONS_LEARNED.md**: Skills/lessons-learned playbook for inference and rollout operations.
+- **docs/reports/inference/INFERENCE_SPEED_LESSONS_LEARNED.md**: Skills/lessons-learned playbook for inference and rollout operations.
 - **config/**: Example JSON (env setup) and YAML (training hyperparams) files.
 - **Orbax Checkpoints**: Snapshots of train state; see `orbax-checkpoint==0.11.18` in requirements.txt.
