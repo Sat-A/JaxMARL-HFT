@@ -14,10 +14,11 @@ A JAX-based framework for multi-agent reinforcement learning for high-frequency 
 ## Latest status and high-signal findings
 
 - The current active work is **IPPO-style policy training on the generative world-model simulator**.
-- Restore portability has been added (`checkpoint_restore_topology=auto|strict|single-device-remap`).
-- Sweep execution now supports safer resumption (`MAX_PARALLEL_GPUS`, `RESUME_SWEEP`, `RETRY_PER_PROFILE`).
-- Historical best observed throughput profile remains **`n_envs=1`** from the last fully successful aggregate.
-- Latest sweep attempts have been unstable/time-limited, so profile lock-in is still pending.
+- Restore portability is implemented (`checkpoint_restore_topology=auto|strict|single-device-remap`).
+- Sweep execution supports resilient resumption (`MAX_PARALLEL_GPUS`, `RESUME_SWEEP`, `RETRY_PER_PROFILE`).
+- Historical best throughput profile remains **`n_envs=1`** (best observed single run: **3.6465 steps/sec**, job `2894876` snapshot).
+- Recent cluster runs are now completing, but policy quality is not yet acceptable: latest train-best aggregate (`train_best_aggregate_2915160.json`) shows **~3.66 mean steps/sec** with **zero trade incidence and zero PnL** across seeds.
+- Current interpretation: training is in a **no-trade / no-reward regime**; throughput is validated, agent quality is not.
 - Detailed operational notes and reports are in `docs/reports/` and next-step tracking is in `docs/plans/`.
 
 ## Quick Start
@@ -30,6 +31,34 @@ conda activate jaxmarl_hft
 pip install "jax[cuda12]"
 pip install -r requirements.txt
 export PYTHONPATH="$(pwd):$PYTHONPATH"
+```
+
+### 1-minute entrance points (recommended)
+
+Use these as the default workflow. Everything else is advanced.
+
+1. **Smoke train on one GPU** (sanity check):
+```bash
+sbatch slurm/sbatch_smoke_gen_worldmodel_train.sh
+```
+
+2. **Profile sweep** (`n_envs` search, resilient):
+```bash
+MAX_PARALLEL_GPUS=1 RESUME_SWEEP=1 POLICY_ARCH=ippo_rnn \
+CHECKPOINT_RESTORE_TOPOLOGY=single-device-remap \
+sbatch slurm/sbatch_sweep_gen_worldmodel_single_node.sh
+```
+
+3. **Train best profile** (multi-seed):
+```bash
+N_ENVS_BEST=2 POLICY_ARCH=ippo_rnn \
+CHECKPOINT_RESTORE_TOPOLOGY=single-device-remap \
+sbatch slurm/sbatch_train_gen_worldmodel_best.sh
+```
+
+4. **Read results**:
+```bash
+ls -1t outputs/gen_worldmodel_pg_train/*aggregate*.json | head
 ```
 
 ### 2) Data layout
@@ -103,6 +132,13 @@ Notes:
 - `policy_arch`: `mlp` (legacy) or `ippo_rnn` (current experimental default).
 - `checkpoint_restore_topology`: `strict`, `auto` (default), or `single-device-remap`.
 - Sweep outputs live under `outputs/gen_worldmodel_pg_train/` and include `summary.json` plus aggregate files when successful.
+
+### Promotion rule (keep it simple)
+
+- Do not promote a profile on throughput alone.
+- Require both:
+  - stable completion + aggregate artifact
+  - non-zero trade incidence and positive/acceptable PnL on holdout checks
 
 ## Docker Setup (alternative)
 

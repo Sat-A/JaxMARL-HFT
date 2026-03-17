@@ -34,12 +34,28 @@ mkdir -p "${CUDA_CACHE_PATH}"
 N_ENVS_BEST="${N_ENVS_BEST:-8}"
 N_UPDATES="${N_UPDATES:-10}"
 N_STEPS="${N_STEPS:-10}"
+POLICY_ARCH="${POLICY_ARCH:-ippo_rnn}"
+CHECKPOINT_RESTORE_TOPOLOGY="${CHECKPOINT_RESTORE_TOPOLOGY:-single-device-remap}"
+MM_ACTION_SPACE="${MM_ACTION_SPACE:-bobStrategy}"
+MM_BOB_V0="${MM_BOB_V0:-10}"
+MM_FIXED_QUANT_VALUE="${MM_FIXED_QUANT_VALUE:-10}"
+LR="${LR:-3e-4}"
+ENTROPY_COEF="${ENTROPY_COEF:-1e-3}"
+VALUE_COEF="${VALUE_COEF:-0.5}"
 
 for i in 0 1 2 3; do
   seed=$((42+i))
   CUDA_VISIBLE_DEVICES="${i}" TMPDIR="${TMPDIR}" python run_gen_worldmodel_pg_train.py \
     --fast_startup \
     --gpu_id "${i}" \
+    --policy_arch "${POLICY_ARCH}" \
+    --checkpoint_restore_topology "${CHECKPOINT_RESTORE_TOPOLOGY}" \
+    --mm_action_space "${MM_ACTION_SPACE}" \
+    --mm_bob_v0 "${MM_BOB_V0}" \
+    --mm_fixed_quant_value "${MM_FIXED_QUANT_VALUE}" \
+    --lr "${LR}" \
+    --entropy_coef "${ENTROPY_COEF}" \
+    --value_coef "${VALUE_COEF}" \
     --n_envs "${N_ENVS_BEST}" \
     --n_updates "${N_UPDATES}" \
     --n_steps "${N_STEPS}" \

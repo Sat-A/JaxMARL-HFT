@@ -31,7 +31,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHON_BIN="${PYTHON_BIN:-python}"
 export N_ENVS_CANDIDATES="${N_ENVS_CANDIDATES:-1 2 4 8}"
 export POLICY_ARCH="${POLICY_ARCH:-ippo_rnn}"
-export CHECKPOINT_RESTORE_TOPOLOGY="${CHECKPOINT_RESTORE_TOPOLOGY:-auto}"
+export CHECKPOINT_RESTORE_TOPOLOGY="${CHECKPOINT_RESTORE_TOPOLOGY:-single-device-remap}"
 export TMPDIR="/tmp"
 mkdir -p "${TMPDIR}"
 export CUDA_CACHE_PATH="/tmp/.nv/ComputeCache"
@@ -61,6 +61,7 @@ for gpu in ${GPU_IDS}; do
   done
   echo "Starting sweep on GPU ${gpu}..."
   GPU_ID="${gpu}" N_UPDATES="${N_UPDATES:-2}" N_STEPS="${N_STEPS:-8}" SWEEP_TAG="${SWEEP_TAG}" \
+    CHECKPOINT_RESTORE_TOPOLOGY="${CHECKPOINT_RESTORE_TOPOLOGY}" \
     bash run_sweep_gen_worldmodel_train_single_node.sh &
   pids+=("$!")
 done

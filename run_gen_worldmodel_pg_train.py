@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import io
 import json
 import os
@@ -14,6 +15,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
+import distrax
+import flax.linen as nn
+from flax.linen.initializers import constant
 
 from run_one_step_inference import (
     _add_python_paths,
@@ -22,7 +27,6 @@ from run_one_step_inference import (
     _latest_checkpoint_step,
     _load_metadata_robust,
     _prepare_date_filtered_data_dir,
-    _restore_params_only,
 )
 from minimal_agent_generative_step import (
     _best_quotes,
@@ -50,6 +54,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_dir", default=str(DEFAULT_DATA))
     p.add_argument("--lobs5_root", default=str(DEFAULT_LOBS5_ROOT))
     p.add_argument("--checkpoint_step", type=int, default=None)
+    p.add_argument(
+        "--checkpoint_restore_topology",
+        choices=["auto", "strict", "single-device-remap"],
+        default="auto",
+        help=(
+            "How to restore checkpoints saved on a different device topology. "
+            "'auto' tries native restore and falls back to single-device remap if native restore fails; "
+            "'strict' disables remap fallback; "
+            "'single-device-remap' always restores using single-device sharding."
+        ),
+    )
     p.add_argument("--sample_index", type=int, default=0)
     p.add_argument("--n_cond_msgs", type=int, default=8)
     p.add_argument("--n_steps", type=int, default=10)
@@ -62,7 +77,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample_top_n", type=int, default=1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--entropy_coef", type=float, default=1e-3)
+    p.add_argument("--value_coef", type=float, default=0.5)
     p.add_argument("--baseline_momentum", type=float, default=0.9)
+    p.add_argument("--policy_arch", choices=["mlp", "ippo_rnn"], default="mlp")
+    p.add_argument("--fc_dim_size", type=int, default=128)
+    p.add_argument("--gru_hidden_dim", type=int, default=128)
+    p.add_argument(
+        "--mm_action_space",
+        choices=["fixed_quants", "fixed_prices", "AvSt", "bobStrategy", "bobRL", "spread_skew", "directional_trading", "simple"],
+        default="bobStrategy",
+        help="Market-making action space used to generate order messages in the simulator loop.",
+    )
+    p.add_argument("--mm_bob_v0", type=int, default=10, help="bob_v0 selector used when mm_action_space=bobRL.")
+    p.add_argument("--mm_fixed_quant_value", type=int, default=10, help="Fixed order quantity for MM action message generation.")
     p.add_argument("--gpu_id", default="0")
     p.add_argument("--fast_startup", action="store_true")
     p.add_argument("--jit_message_build", action="store_true")
@@ -70,6 +97,132 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_root", default=str(REPO_ROOT / "outputs" / "gen_worldmodel_pg_train"))
     p.add_argument("--run_name", default="")
     return p.parse_args()
+
+
+def _collect_exception_messages(exc: BaseException | None) -> list[str]:
+    msgs: list[str] = []
+    seen: set[int] = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msg = str(cur).strip()
+        if msg:
+            msgs.append(msg)
+        cur = cur.__cause__ or cur.__context__
+    return msgs
+
+
+def _is_topology_mismatch_restore_error(exc: BaseException) -> bool:
+    msg = " | ".join(_collect_exception_messages(exc)).lower()
+    mismatch_markers = (
+        "topology",
+        "sharding passed to deserialization",
+        "incompatible sharding",
+        "cannot deserialize array",
+        "deserialization requires",
+        "saved sharding",
+        "different device",
+        "device topology",
+        "device count",
+        "num_devices",
+        "global shape",
+        "device assignment",
+        "device ids",
+        "addressable devices",
+        "process count",
+        "mesh",
+        "cannot reshape",
+        "sharding",
+    )
+    return any(marker in msg for marker in mismatch_markers)
+
+
+def _restore_with_single_device_remap(
+    checkpointer: ocp.PyTreeCheckpointer,
+    state_dir: Path,
+) -> dict[str, Any]:
+    meta_tree = checkpointer.metadata(str(state_dir)).tree
+    single = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+    def _to_struct(x):
+        if x is None:
+            return None
+        if isinstance(x, jax.ShapeDtypeStruct):
+            return jax.ShapeDtypeStruct(shape=tuple(x.shape), dtype=jnp.dtype(x.dtype), sharding=single)
+        if hasattr(x, "shape") and hasattr(x, "dtype"):
+            return jax.ShapeDtypeStruct(shape=tuple(x.shape), dtype=jnp.dtype(x.dtype), sharding=single)
+        return x
+
+    target = jax.tree_util.tree_map(_to_struct, meta_tree)
+
+    def _to_restore_arg(x):
+        if isinstance(x, jax.ShapeDtypeStruct):
+            return ocp.ArrayRestoreArgs(sharding=single)
+        return None
+
+    restore_args = jax.tree_util.tree_map(_to_restore_arg, target)
+    return checkpointer.restore(
+        str(state_dir),
+        args=ocp.args.PyTreeRestore(item=target, restore_args=restore_args),
+    )
+
+
+def _restore_params_with_topology_policy(
+    ckpt_path: Path,
+    step: int,
+    restore_mode: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    state_dir = ckpt_path / str(step) / "state"
+    if not state_dir.is_dir():
+        raise FileNotFoundError(f"Checkpoint state directory not found: {state_dir}")
+    checkpointer = ocp.PyTreeCheckpointer()
+    restore_meta = {
+        "requested_mode": restore_mode,
+        "effective_mode": None,
+        "used_single_device_remap": False,
+        "fallback_from_auto_used": False,
+        "auto_fallback_reason": None,
+        "topology_mismatch_detected": False,
+        "native_restore_error": None,
+    }
+
+    restored: dict[str, Any]
+    if restore_mode == "single-device-remap":
+        restored = _restore_with_single_device_remap(checkpointer, state_dir)
+        restore_meta["effective_mode"] = "single-device-remap"
+        restore_meta["used_single_device_remap"] = True
+    else:
+        try:
+            restored = checkpointer.restore(str(state_dir))
+            restore_meta["effective_mode"] = "native"
+        except Exception as exc:
+            restore_meta["native_restore_error"] = " | ".join(_collect_exception_messages(exc))[:800]
+            restore_meta["topology_mismatch_detected"] = _is_topology_mismatch_restore_error(exc)
+            if restore_mode == "strict":
+                if restore_mode == "strict" and restore_meta["topology_mismatch_detected"]:
+                    raise RuntimeError(
+                        "Checkpoint restore failed due to topology mismatch and strict mode is enabled. "
+                        "Re-run with --checkpoint_restore_topology=auto or "
+                        "--checkpoint_restore_topology=single-device-remap."
+                    ) from exc
+                raise
+            restore_meta["auto_fallback_reason"] = (
+                "topology-mismatch-detected" if restore_meta["topology_mismatch_detected"] else "native-restore-error"
+            )
+            try:
+                restored = _restore_with_single_device_remap(checkpointer, state_dir)
+            except Exception as remap_exc:
+                raise RuntimeError(
+                    "Checkpoint restore failed in auto mode: native restore failed and single-device remap fallback "
+                    "also failed. Inspect native_restore_error and fallback exception details."
+                ) from remap_exc
+            restore_meta["effective_mode"] = "single-device-remap"
+            restore_meta["used_single_device_remap"] = True
+            restore_meta["fallback_from_auto_used"] = True
+
+    if not isinstance(restored, dict) or "params" not in restored:
+        raise RuntimeError(f"Unexpected checkpoint state format in {state_dir}")
+    return restored["params"], restore_meta
 
 
 def _build_obs(step_i: int, bid: int, ask: int, agent_state, world_time: jnp.ndarray) -> jnp.ndarray:
@@ -126,6 +279,81 @@ def _policy_loss(
     return loss, {"entropy": jnp.mean(entropy), "logp": jnp.mean(chosen_logp)}
 
 
+class LocalScannedRNN(nn.Module):
+    @functools.partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, carry: jax.Array, x: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+        obs_embed, resets = x
+        carry = jnp.where(resets[:, None], self.initialize_carry(*carry.shape), carry)
+        safe_init = nn.initializers.variance_scaling(1.0, "fan_in", "truncated_normal")
+        new_carry, y = nn.GRUCell(
+            features=obs_embed.shape[-1],
+            kernel_init=safe_init,
+            recurrent_kernel_init=safe_init,
+            bias_init=constant(0.0),
+        )(carry, obs_embed)
+        return new_carry, y
+
+    @staticmethod
+    def initialize_carry(batch_size: int, hidden_size: int) -> jax.Array:
+        cell = nn.GRUCell(features=hidden_size)
+        return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
+
+
+class LocalActorCriticRNN(nn.Module):
+    action_dim: int
+    config: dict[str, Any]
+
+    @nn.compact
+    def __call__(self, hidden: jax.Array, x: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, distrax.Categorical, jax.Array]:
+        obs, dones = x  # obs:[T,B,O], dones:[T,B]
+        # Avoid orthogonal init (QR/SVD) to prevent cuSolver handle failures on some cluster nodes.
+        safe_init = nn.initializers.variance_scaling(1.0, "fan_in", "truncated_normal")
+        embed = nn.Dense(
+            self.config["FC_DIM_SIZE"],
+            kernel_init=safe_init,
+            bias_init=constant(0.0),
+        )(obs)
+        embed = nn.relu(embed)
+
+        hidden, embed = LocalScannedRNN()(hidden, (embed, dones))
+
+        actor_h = nn.Dense(
+            self.config["GRU_HIDDEN_DIM"],
+            kernel_init=safe_init,
+            bias_init=constant(0.0),
+        )(embed)
+        actor_h = nn.relu(actor_h)
+        logits = nn.Dense(
+            self.action_dim,
+            kernel_init=safe_init,
+            bias_init=constant(0.0),
+        )(actor_h)
+        pi = distrax.Categorical(logits=logits)
+
+        critic_h = nn.Dense(
+            self.config["FC_DIM_SIZE"],
+            kernel_init=safe_init,
+            bias_init=constant(0.0),
+        )(embed)
+        critic_h = nn.relu(critic_h)
+        values = nn.Dense(1, kernel_init=safe_init, bias_init=constant(0.0))(critic_h)
+        return hidden, pi, jnp.squeeze(values, axis=-1)
+
+
+def _ippo_recurrent_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "FC_DIM_SIZE": int(args.fc_dim_size),
+        "GRU_HIDDEN_DIM": int(args.gru_hidden_dim),
+    }
+
+
 def main() -> int:
     run_t0 = time.perf_counter()
     args = parse_args()
@@ -144,8 +372,22 @@ def main() -> int:
 
     step = args.checkpoint_step if args.checkpoint_step is not None else _latest_checkpoint_step(ckpt_path)
     t_restore_t0 = time.perf_counter()
-    params = _restore_params_only(ckpt_path, step)
+    params, restore_meta = _restore_params_with_topology_policy(
+        ckpt_path,
+        step,
+        args.checkpoint_restore_topology,
+    )
     restore_sec = float(time.perf_counter() - t_restore_t0)
+    print(
+        "[checkpoint-restore] "
+        f"requested={restore_meta['requested_mode']} effective={restore_meta['effective_mode']} "
+        f"single_device_remap={restore_meta['used_single_device_remap']} "
+        f"fallback_from_auto={restore_meta['fallback_from_auto_used']}"
+    )
+    if restore_meta["native_restore_error"]:
+        print(f"[checkpoint-restore] native_error={restore_meta['native_restore_error']}")
+    if restore_meta["fallback_from_auto_used"]:
+        print(f"[checkpoint-restore] fallback_reason={restore_meta['auto_fallback_reason']}")
     ckpt_vocab_size = int(params["message_encoder"]["encoder"]["embedding"].shape[0])
     if ckpt_vocab_size >= 10000:
         _enable_legacy_token_mode_22()
@@ -217,7 +459,11 @@ def main() -> int:
     sim_init_sec = float(time.perf_counter() - t_sim_init_t0)
 
     world_cfg = World_EnvironmentConfig(tick_size=100)
-    mm_cfg = MarketMaking_EnvironmentConfig(action_space="bobStrategy", fixed_quant_value=10, bob_v0=10)
+    mm_cfg = MarketMaking_EnvironmentConfig(
+        action_space=args.mm_action_space,
+        fixed_quant_value=int(args.mm_fixed_quant_value),
+        bob_v0=int(args.mm_bob_v0),
+    )
     mm_agent = MarketMakingAgent(cfg=mm_cfg, world_config=world_cfg)
 
     initial_agent_state = MMEnvState(
@@ -256,36 +502,79 @@ def main() -> int:
     policy_key, rng = jax.random.split(rng)
     obs_dim = 12
     n_actions = int(mm_cfg.n_actions)
-    policy_params = _init_policy_params(policy_key, obs_dim=obs_dim, hidden_dim=64, n_actions=n_actions)
+
+    policy_kind = args.policy_arch
+    network = None
+    recurrent_hstate0 = None
+    if policy_kind == "ippo_rnn":
+        ippo_cfg = _ippo_recurrent_config(args)
+        network = LocalActorCriticRNN(n_actions, config=ippo_cfg)
+        init_x = (
+            jnp.zeros((1, n_envs, obs_dim), dtype=jnp.float32),
+            jnp.zeros((1, n_envs), dtype=jnp.float32),
+        )
+        recurrent_hstate0 = LocalScannedRNN.initialize_carry(n_envs, ippo_cfg["GRU_HIDDEN_DIM"])
+        policy_params = network.init(policy_key, recurrent_hstate0, init_x)
+    else:
+        policy_params = _init_policy_params(policy_key, obs_dim=obs_dim, hidden_dim=64, n_actions=n_actions)
+
     optimizer = optax.adam(args.lr)
     opt_state = optimizer.init(policy_params)
 
     baseline = 0.0
     update_logs: list[dict[str, Any]] = []
+    episode_trade_counts_latest: list[float] = []
 
     for upd in range(args.n_updates):
         env_sim_states = [jax.tree_util.tree_map(lambda x, i=i: x[i], sim_states_all) for i in range(n_envs)]
         env_agent_states = [initial_agent_state for _ in range(n_envs)]
         env_world_times = [jnp.array(init_time_batched[i], dtype=jnp.int32) for i in range(n_envs)]
 
-        obs_rows: list[jax.Array] = []
-        act_rows: list[int] = []
+        obs_rows: list[list[jax.Array]] = []
+        act_rows: list[list[int]] = []
         final_pnls: list[float] = []
+        final_trade_counts: list[float] = []
         step_lat_ms: list[float] = []
         t_roll_t0 = time.perf_counter()
+        recurrent_hstate = recurrent_hstate0
 
         for step_i in range(args.n_steps):
+            step_obs: list[jax.Array] = []
+            for env_i in range(n_envs):
+                cur_sim = env_sim_states[env_i]
+                cur_time = env_world_times[env_i]
+                agent_state = env_agent_states[env_i]
+                bid, ask = _best_quotes(sim, cur_sim)
+                step_obs.append(_build_obs(step_i, bid, ask, agent_state, cur_time))
+
+            obs_step_batch = jnp.stack(step_obs, axis=0)
+            if policy_kind == "ippo_rnn":
+                assert network is not None and recurrent_hstate is not None
+                done_step_batch = jnp.zeros((n_envs,), dtype=jnp.float32)
+                recurrent_hstate, pi, _ = network.apply(
+                    policy_params,
+                    recurrent_hstate,
+                    (obs_step_batch[jnp.newaxis, :], done_step_batch[jnp.newaxis, :]),
+                )
+                rng, rs = jax.random.split(rng)
+                sampled = jax.device_get(pi.sample(seed=rs)).astype(np.int32)
+                if sampled.ndim == 2:
+                    sampled = sampled[0]
+                action_step = sampled.tolist()
+            else:
+                action_step = []
+                for env_i in range(n_envs):
+                    rng, rs = jax.random.split(rng)
+                    logits = _policy_logits(policy_params, obs_step_batch[env_i])
+                    action_step.append(int(jax.random.categorical(rs, logits)))
+
             for env_i in range(n_envs):
                 t0 = time.perf_counter()
                 cur_sim = env_sim_states[env_i]
                 cur_time = env_world_times[env_i]
                 agent_state = env_agent_states[env_i]
-
-                bid, ask = _best_quotes(sim, cur_sim)
-                obs = _build_obs(step_i, bid, ask, agent_state, cur_time)
-                logits = _policy_logits(policy_params, obs)
-                rng, rs = jax.random.split(rng)
-                action = int(jax.random.categorical(rs, logits))
+                obs = obs_step_batch[env_i]
+                action = int(action_step[env_i])
                 action_j = jnp.int32(action)
 
                 if message_build_fn is not None:
@@ -361,9 +650,10 @@ def main() -> int:
                 env_sim_states[env_i] = sim_after_step
                 env_world_times[env_i] = cur_time
 
-                obs_rows.append(obs)
-                act_rows.append(action)
                 step_lat_ms.append((time.perf_counter() - t0) * 1000.0)
+
+            obs_rows.append(step_obs)
+            act_rows.append(action_step)
 
         for env_i in range(n_envs):
             final_sim_i = env_sim_states[env_i]
@@ -375,23 +665,51 @@ def main() -> int:
                 final_midprice=final_mid_i,
             )
             final_pnls.append(float(final_pnl["total_pnl"]))
+            final_trade_counts.append(float(final_pnl["agent_trade_count"]))
 
         rollout_sec = float(time.perf_counter() - t_roll_t0)
-        obs_batch = jnp.stack(obs_rows, axis=0)
-        act_batch = jnp.asarray(act_rows, dtype=jnp.int32)
+        obs_seq = jnp.asarray(obs_rows, dtype=jnp.float32)  # [T, B, O]
+        act_seq = jnp.asarray(act_rows, dtype=jnp.int32)  # [T, B]
         rewards_env = np.asarray(final_pnls, dtype=np.float32)
+        trade_counts_env = np.asarray(final_trade_counts, dtype=np.float32)
+        episode_trade_counts_latest = final_trade_counts
         avg_pnl = float(rewards_env.mean())
         baseline = args.baseline_momentum * baseline + (1.0 - args.baseline_momentum) * avg_pnl
-        advantages = np.repeat(rewards_env - baseline, args.n_steps).astype(np.float32)
-        adv_batch = jnp.asarray(advantages)
+        returns = np.repeat(rewards_env[None, :], args.n_steps, axis=0).astype(np.float32)
+        adv_seq = returns - np.float32(baseline)
 
-        (loss, aux), grads = jax.value_and_grad(_policy_loss, has_aux=True)(
-            policy_params,
-            obs_batch,
-            act_batch,
-            adv_batch,
-            float(args.entropy_coef),
-        )
+        if policy_kind == "ippo_rnn":
+            assert network is not None and recurrent_hstate0 is not None
+            done_seq = jnp.zeros((args.n_steps, n_envs), dtype=jnp.float32)
+            returns_j = jnp.asarray(returns, dtype=jnp.float32)
+            adv_j = jnp.asarray(adv_seq, dtype=jnp.float32)
+
+            def _loss_fn(params):
+                _, pi, values = network.apply(params, recurrent_hstate0, (obs_seq, done_seq))
+                logp = pi.log_prob(act_seq)
+                entropy = pi.entropy()
+                policy_loss = -jnp.mean(adv_j * logp + float(args.entropy_coef) * entropy)
+                value_loss = jnp.mean(jnp.square(values - returns_j))
+                total = policy_loss + float(args.value_coef) * value_loss
+                return total, {
+                    "entropy": jnp.mean(entropy),
+                    "logp": jnp.mean(logp),
+                    "policy_loss": policy_loss,
+                    "value_loss": value_loss,
+                }
+
+            (loss, aux), grads = jax.value_and_grad(_loss_fn, has_aux=True)(policy_params)
+        else:
+            obs_batch = obs_seq.reshape((args.n_steps * n_envs, obs_dim))
+            act_batch = act_seq.reshape((args.n_steps * n_envs,))
+            adv_batch = jnp.asarray(adv_seq.reshape((args.n_steps * n_envs,)), dtype=jnp.float32)
+            (loss, aux), grads = jax.value_and_grad(_policy_loss, has_aux=True)(
+                policy_params,
+                obs_batch,
+                act_batch,
+                adv_batch,
+                float(args.entropy_coef),
+            )
         updates, opt_state = optimizer.update(grads, opt_state, policy_params)
         policy_params = optax.apply_updates(policy_params, updates)
 
@@ -401,12 +719,20 @@ def main() -> int:
             "update": upd + 1,
             "avg_pnl": avg_pnl,
             "pnl_std": float(rewards_env.std()),
+            "avg_agent_trade_count": float(trade_counts_env.mean()),
+            "episodes_with_agent_trades": int(np.sum(trade_counts_env > 0)),
+            "agent_trade_fraction": float(np.mean(trade_counts_env > 0)),
             "loss": float(loss),
             "entropy": float(aux["entropy"]),
+            "policy_arch": policy_kind,
             "steps_per_sec": steps_per_sec,
             "step_latency_ms_p50": float(np.percentile(step_lat_ms, 50)) if step_lat_ms else 0.0,
             "step_latency_ms_p95": float(np.percentile(step_lat_ms, 95)) if step_lat_ms else 0.0,
         }
+        if "policy_loss" in aux:
+            update_log["policy_loss"] = float(aux["policy_loss"])
+        if "value_loss" in aux:
+            update_log["value_loss"] = float(aux["value_loss"])
         update_logs.append(update_log)
         print(
             f"update={upd + 1}/{args.n_updates} avg_pnl={avg_pnl:.4f} loss={float(loss):.5f} "
@@ -417,8 +743,19 @@ def main() -> int:
     summary = {
         "run_name": run_name,
         "run_dir": str(run_dir),
+        "policy_arch": policy_kind,
         "checkpoint_path": str(ckpt_path),
         "checkpoint_step": int(step),
+        "checkpoint_restore": {
+            "state_dir": str(ckpt_path / str(step) / "state"),
+            "requested_mode": str(restore_meta["requested_mode"]),
+            "effective_mode": str(restore_meta["effective_mode"]),
+            "used_single_device_remap": bool(restore_meta["used_single_device_remap"]),
+            "fallback_from_auto_used": bool(restore_meta["fallback_from_auto_used"]),
+            "auto_fallback_reason": restore_meta["auto_fallback_reason"],
+            "topology_mismatch_detected": bool(restore_meta["topology_mismatch_detected"]),
+            "native_restore_error": restore_meta["native_restore_error"],
+        },
         "data_dir": str(data_dir),
         "dataset_effective_dir": str(selected_data_dir),
         "start_date": args.start_date,
@@ -429,6 +766,14 @@ def main() -> int:
         "n_updates": int(args.n_updates),
         "n_cond_msgs": int(args.n_cond_msgs),
         "action_dim": int(n_actions),
+        "mm_action_space": str(args.mm_action_space),
+        "mm_bob_v0": int(args.mm_bob_v0),
+        "mm_fixed_quant_value": int(args.mm_fixed_quant_value),
+        "selection_metrics": {
+            "quality_primary": "pnl.mean_avg_pnl",
+            "quality_guardrail": "pnl.final_avg_pnl > 0 and trade_incidence > 0",
+            "throughput_tiebreaker": "throughput.updates_mean_steps_per_sec",
+        },
         "throughput": {
             "updates_mean_steps_per_sec": float(np.mean([u["steps_per_sec"] for u in update_logs])) if update_logs else 0.0,
             "updates_max_steps_per_sec": float(np.max([u["steps_per_sec"] for u in update_logs])) if update_logs else 0.0,
@@ -438,6 +783,11 @@ def main() -> int:
             "mean_avg_pnl": float(np.mean(avg_pnls)) if avg_pnls else 0.0,
             "best_avg_pnl": float(np.max(avg_pnls)) if avg_pnls else 0.0,
             "final_avg_pnl": float(avg_pnls[-1]) if avg_pnls else 0.0,
+        },
+        "trade_incidence": {
+            "episodes_with_trades": int(sum(1 for c in episode_trade_counts_latest if c > 0.0)),
+            "fraction": float(sum(1 for c in episode_trade_counts_latest if c > 0.0) / max(1, len(episode_trade_counts_latest))),
+            "mean_agent_trade_count": float(np.mean(episode_trade_counts_latest)) if episode_trade_counts_latest else 0.0,
         },
         "timing_breakdown": {
             "restore_sec": restore_sec,

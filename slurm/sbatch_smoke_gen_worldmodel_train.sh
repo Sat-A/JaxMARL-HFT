@@ -33,6 +33,14 @@ export CUDA_CACHE_PATH="/tmp/.nv/ComputeCache"
 mkdir -p "${CUDA_CACHE_PATH}"
 python run_gen_worldmodel_pg_train.py \
   --fast_startup \
+  --policy_arch "${POLICY_ARCH:-ippo_rnn}" \
+  --checkpoint_restore_topology "${CHECKPOINT_RESTORE_TOPOLOGY:-single-device-remap}" \
+  --mm_action_space "${MM_ACTION_SPACE:-bobStrategy}" \
+  --mm_bob_v0 "${MM_BOB_V0:-10}" \
+  --mm_fixed_quant_value "${MM_FIXED_QUANT_VALUE:-10}" \
+  --lr "${LR:-3e-4}" \
+  --entropy_coef "${ENTROPY_COEF:-1e-3}" \
+  --value_coef "${VALUE_COEF:-0.5}" \
   --n_envs "${N_ENVS:-1}" \
   --n_updates "${N_UPDATES:-1}" \
   --n_steps "${N_STEPS:-2}" \
