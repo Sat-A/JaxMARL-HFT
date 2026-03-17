@@ -128,6 +128,24 @@ sbatch slurm/sbatch_sweep_gen_worldmodel_single_node.sh
 N_ENVS_BEST=<best_n_envs> sbatch slurm/sbatch_train_gen_worldmodel_best.sh
 ```
 
+### Profile-driven submission (new, recommended for experimentation)
+
+Define agent/training knobs once in an env profile and submit by mode:
+
+```bash
+# Dry-run (no job submitted)
+bash scripts/experiments/submit_genwm_profile.sh \
+  config/gen_worldmodel_profiles/aggressive_pnl.env smoke
+
+# Submit smoke/sweep/train-best with the same profile
+bash scripts/experiments/submit_genwm_profile.sh \
+  config/gen_worldmodel_profiles/aggressive_pnl.env smoke --submit
+bash scripts/experiments/submit_genwm_profile.sh \
+  config/gen_worldmodel_profiles/aggressive_pnl.env sweep --submit
+bash scripts/experiments/submit_genwm_profile.sh \
+  config/gen_worldmodel_profiles/aggressive_pnl.env train-best --submit
+```
+
 Notes:
 - `policy_arch`: `mlp` (legacy) or `ippo_rnn` (current experimental default).
 - `checkpoint_restore_topology`: `strict`, `auto` (default), or `single-device-remap`.

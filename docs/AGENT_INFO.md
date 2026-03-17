@@ -116,3 +116,17 @@ From `config/rl_configs/ippo_rnn_JAXMARL_2player.yaml` and `ippo_rnn_JAXMARL_mm_
   - start with smoke (`n_updates`/`n_steps` small), then scale.
 - Promotion rule: do not promote on throughput alone; require non-zero trade incidence and acceptable PnL.
 
+## 6) Aggressive PnL profile (ready to submit)
+
+- Profile file: `config/gen_worldmodel_profiles/aggressive_pnl.env`
+- Submission helper: `scripts/experiments/submit_genwm_profile.sh`
+- Supports modes:
+  - `smoke` (quick sanity)
+  - `sweep` (`n_envs` profile search)
+  - `train-best` (multi-seed deeper run)
+
+Example:
+```bash
+bash scripts/experiments/submit_genwm_profile.sh \
+  config/gen_worldmodel_profiles/aggressive_pnl.env smoke --submit
+```
