@@ -158,6 +158,7 @@ The repo is mounted at `/home/myuser/` and data at `/home/myuser/data/`, so the 
 - `gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py`: original IPPO training entrypoint
 - `run_gen_worldmodel_pg_train.py`: generative-world-model training/experiment entrypoint
 - `slurm/`: cluster job wrappers (smoke, sweep, train-best)
+- `docs/AGENT_INFO.md`: agent/policy types, tunables, and optimization goals
 
 ## Citation
 
